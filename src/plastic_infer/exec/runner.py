@@ -45,6 +45,9 @@ class ModelConfig:
     max_seq_len: int
     rope_base: float = 10000.0
     dtype: torch.dtype = torch.float32
+    # MoE fields (0 = pure dense model).
+    n_experts: int = 0               # experts per layer (Mixtral-style)
+    n_experts_per_tok: int = 0       # top-k routing width
 
 
 class DenseKVCache:

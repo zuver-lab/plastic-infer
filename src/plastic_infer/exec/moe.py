@@ -13,6 +13,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from ..store.experts import ExpertWeights
+
 
 def topk_route(
     router_logits: torch.Tensor,   # [num_tokens, num_experts]
@@ -101,5 +103,76 @@ def moe_forward_reference(
             down = up @ w2        # [H]
             acc += down * weights[t, ki]
         out[t] = acc
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Sparse routed experts (M1): only the routed subset is resident
+# ---------------------------------------------------------------------------
+
+
+def swiglu_mlp(x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor,
+               w3: torch.Tensor) -> torch.Tensor:
+    """One Mixtral-style expert MLP: silu(x @ w1^T) * (x @ w3^T) then w2."""
+    return F.linear(F.silu(F.linear(x, w1)) * F.linear(x, w3), w2)
+
+
+def moe_forward_sparse(
+    hidden: torch.Tensor,               # [num_tokens, hidden_dim]
+    experts: dict[int, ExpertWeights],  # routed experts (eid -> weights)
+    expert_ids: torch.Tensor,           # [num_tokens, k]
+    weights: torch.Tensor,              # [num_tokens, k] routing weights
+) -> torch.Tensor:
+    """MoE forward with only the routed experts resident (M1).
+
+    For each unique expert, gather the tokens routed to it and run a
+    batched SwiGLU GEMM; weighted results are scattered back with
+    index_add_. Matches the §5.4 plan: route maps (token, expert) to
+    per-expert mini-batches, index_select then batched matmul.
+
+    Correctness-first (v1). The interface stays put for a grouped-GEMM
+    kernel later.
+    """
+    T, H = hidden.shape
+    k = expert_ids.shape[1]
+    out = torch.zeros_like(hidden)
+    ids = expert_ids  # [T, k]
+
+    for eid, w in experts.items():
+        pairs = (ids == eid).nonzero()   # [n, 2] (token, slot)
+        if pairs.shape[0] == 0:
+            continue
+        rows = pairs[:, 0]
+        wts = weights[rows, pairs[:, 1]].unsqueeze(1)   # [n, 1]
+
+        x = hidden[rows]                                # [n, H]
+        inter = F.silu(F.linear(x, w.w1)) * F.linear(x, w.w3)  # [n, I]
+        d = F.linear(inter, w.w2)                       # [n, H]
+        out.index_add_(0, rows, d * wts)
+
+    return out
+
+
+def moe_forward_reference_swiglu(
+    hidden: torch.Tensor,
+    experts: dict[int, ExpertWeights],
+    expert_ids: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    """Per-token loop ground truth for the sparse SwiGLU forward.
+
+    Used only as the reference for unit tests.
+    """
+    T, H = hidden.shape
+    k = expert_ids.shape[1]
+    out = torch.zeros_like(hidden)
+
+    for t in range(T):
+        for s in range(k):
+            eid = int(expert_ids[t, s])
+            w = experts[eid]
+            inter = F.silu(F.linear(hidden[t], w.w1)) * F.linear(hidden[t], w.w3)
+            out[t] += F.linear(inter, w.w2) * weights[t, s]
 
     return out

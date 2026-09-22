@@ -22,9 +22,13 @@ from plastic_infer.exec.attention import (
 )
 from plastic_infer.exec.moe import (
     moe_forward_reference,
+    moe_forward_reference_swiglu,
+    moe_forward_sparse,
     moe_forward_v1,
+    swiglu_mlp,
     topk_route,
 )
+from plastic_infer.store.experts import ExpertWeights
 
 
 # ---------------------------------------------------------------------------
@@ -370,3 +374,67 @@ class TestMoEForward:
 
         out = moe_forward_v1(hidden, expert_w1, expert_w2, ids, weights)
         assert out.shape == (T, H)
+
+
+class TestSparseMoEForward:
+    """M1 sparse path: only the routed experts are resident."""
+
+    @staticmethod
+    def _experts(E: int, H: int, I: int, seed: int = 7
+                 ) -> dict[int, ExpertWeights]:
+        g = torch.Generator().manual_seed(seed)
+        return {
+            e: ExpertWeights(
+                w1=torch.randn(I, H, generator=g) * 0.1,
+                w2=torch.randn(H, I, generator=g) * 0.1,
+                w3=torch.randn(I, H, generator=g) * 0.1,
+            )
+            for e in range(E)
+        }
+
+    def test_sparse_matches_reference(self) -> None:
+        torch.manual_seed(11)
+        T, H, I, E, k = 8, 16, 32, 4, 2
+        hidden = torch.randn(T, H) * 0.5
+        experts = self._experts(E, H, I)
+        router_logits = torch.randn(T, E)
+        eids, weights = topk_route(router_logits, k=k)
+
+        # Serve only the routed subset (as the slot pool would)
+        routed = {int(e) for e in eids.flatten().tolist()}
+        subset = {e: experts[e] for e in routed}
+
+        out = moe_forward_sparse(hidden, subset, eids, weights)
+        ref = moe_forward_reference_swiglu(hidden, experts, eids, weights)
+        assert out.shape == ref.shape
+        assert torch.allclose(out, ref, atol=1e-5)
+
+    def test_single_token_single_expert(self) -> None:
+        """k=1 single token: silu(x w1^T) * (x w3^T) then w2."""
+        T, H, I, k = 1, 4, 8, 1
+        hidden = torch.randn(T, H)
+        w = ExpertWeights(w1=torch.randn(I, H), w2=torch.randn(H, I),
+                          w3=torch.randn(I, H))
+        eids = torch.zeros(T, k, dtype=torch.long)
+        weights = torch.ones(T, k)
+
+        out = moe_forward_sparse(hidden, {0: w}, eids, weights)
+        ref = swiglu_mlp(hidden, w.w1, w.w2, w.w3)
+        assert torch.allclose(out, ref, atol=1e-5)
+
+    def test_unrouted_experts_not_needed(self) -> None:
+        """Passing only routed experts is sufficient (D5 at op level)."""
+        torch.manual_seed(13)
+        T, H, I, E, k = 12, 16, 32, 8, 2
+        hidden = torch.randn(T, H) * 0.5
+        experts = self._experts(E, H, I, seed=3)
+        router_logits = torch.randn(T, E)
+        eids, weights = topk_route(router_logits, k=k)
+
+        routed = {int(e) for e in eids.flatten().tolist()}
+        subset = {e: experts[e] for e in routed}
+
+        # Sparse (routed subset) must equal full-dict forward
+        sparse = moe_forward_sparse(hidden, subset, eids, weights)
+        full = moe_forward_sparse(hidden, experts, eids, weights)
+        assert torch.allclose(sparse, full, atol=1e-6)

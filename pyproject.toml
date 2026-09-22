@@ -13,6 +13,12 @@ dev = [
     "pytest>=7.0",
     "pytest-randomly>=3.0",
 ]
+cli = [
+    "tokenizers>=0.19",
+]
+
+[project.scripts]
+plastic-infer = "plastic_infer.runtime.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

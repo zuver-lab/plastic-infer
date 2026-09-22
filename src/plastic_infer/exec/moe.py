@@ -26,9 +26,15 @@ def topk_route(
         (expert_ids, weights)
         expert_ids: [num_tokens, k]   int64
         weights:     [num_tokens, k]   softmax of top-k logits
+
+    Routing weights are computed in fp32 regardless of logit dtype
+    (Qwen3's norm_topk_prob renormalization: softmax of the selected
+    top-k is mathematically identical to softmax-all -> topk ->
+    renormalize, so no special case is needed — fp32 keeps the expert
+    selection stable for bf16 checkpoints).
     """
     top_logits, top_ids = torch.topk(router_logits, k, dim=-1)
-    weights = F.softmax(top_logits, dim=-1)
+    weights = F.softmax(top_logits.float(), dim=-1).to(router_logits.dtype)
     return top_ids, weights
 
 

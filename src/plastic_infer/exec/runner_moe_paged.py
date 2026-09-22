@@ -17,7 +17,7 @@ import torch
 
 from ..kv.kv_store import KVRequestCache, KVStore
 from ..store.experts import ExpertSlotPool
-from .attention import build_rope_cache, rms_norm, rope_positions
+from .attention import build_rope_cache, qk_norm, rms_norm, rope_positions
 from .moe import moe_forward_sparse, topk_route
 from .runner import DenseWeights, ModelConfig, linear
 from .runner_moe import _moe_ffn
@@ -68,6 +68,12 @@ def prefill_forward_moe_paged(
         q = q.view(1, seq_len, config.n_heads, config.head_dim)
         k = k.view(1, seq_len, config.n_kv_heads, config.head_dim)
         v = v.view(1, seq_len, config.n_kv_heads, config.head_dim)
+        if config.qk_norm:
+            q, k = qk_norm(
+                q, k,
+                weights[f"layers.{layer_idx}.self_attn.q_norm.weight"],
+                weights[f"layers.{layer_idx}.self_attn.k_norm.weight"],
+                config.head_dim)
         q = rope_positions(cos, sin, positions, q)
         k = rope_positions(cos, sin, positions, k)
 
@@ -127,6 +133,12 @@ def decode_step_moe_paged(
         q = q.view(1, 1, config.n_heads, config.head_dim)
         k = k.view(1, 1, config.n_kv_heads, config.head_dim)
         v = v.view(1, 1, config.n_kv_heads, config.head_dim)
+        if config.qk_norm:
+            q, k = qk_norm(
+                q, k,
+                weights[f"layers.{layer_idx}.self_attn.q_norm.weight"],
+                weights[f"layers.{layer_idx}.self_attn.k_norm.weight"],
+                config.head_dim)
         q = rope_positions(cos, sin, pos_tensor, q)
         k = rope_positions(cos, sin, pos_tensor, k)
 

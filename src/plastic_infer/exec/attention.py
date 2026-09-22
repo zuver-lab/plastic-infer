@@ -56,13 +56,21 @@ def build_rope_cache(
     device: torch.device | None = None,
     dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Precompute RoPE cos/sin tables."""
+    """Precompute RoPE cos/sin tables.
+
+    Layout matches transformers' default rotary exactly:
+    ``emb = torch.cat((freqs, freqs), dim=-1)`` — the first d/2 columns
+    are the d/2 distinct frequencies, the second d/2 columns repeat
+    them, so ``cos[j] = cos(pos * freq[j % (d/2)])``. This pairs with
+    ``rotate_half`` (element j rotates against j + d/2 using angle
+    freq[j % (d/2)]), matching HF's ``apply_rotary_pos_emb``.
+    """
     inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=dtype, device=device) / head_dim))
     t = torch.arange(seq_len, dtype=dtype, device=device)
     freqs = torch.outer(t, inv_freq)
-    # For classic RoPE, cos and sin each have head_dim elements (repeated pairs)
-    cos = freqs.cos().repeat_interleave(2, dim=-1)
-    sin = freqs.sin().repeat_interleave(2, dim=-1)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos = emb.cos()
+    sin = emb.sin()
     return cos, sin
 
 
@@ -70,6 +78,21 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.
     """RMS normalization."""
     rms = torch.sqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
     return x / rms * weight
+
+
+def qk_norm(q: torch.Tensor, k: torch.Tensor,
+            q_weight: torch.Tensor, k_weight: torch.Tensor,
+            head_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Qwen3-style QK-norm: per-head RMSNorm on q and k, before RoPE.
+
+    q/k are [batch, seq, n_heads, head_dim] (views of the projected
+    hidden states); the norm acts over head_dim (weight shape
+    [head_dim]) and the result is reshaped back. Applied before rotary
+    embeddings, matching HF's q_norm/k_norm order.
+    """
+    q = rms_norm(q.reshape(-1, head_dim), q_weight).view(q.shape)
+    k = rms_norm(k.reshape(-1, head_dim), k_weight).view(k.shape)
+    return q, k
 
 
 # ---------------------------------------------------------------------------

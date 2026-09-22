@@ -16,6 +16,7 @@ loads and evicts more often.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import torch
@@ -73,6 +74,73 @@ class ExpertBank:
     @property
     def total_bytes(self) -> int:
         return sum(self._bytes.values())
+
+
+class HostExpertLru:
+    """Host LRU cache of experts over a lazy source (disk) — the
+    HOST_FIRST middle tier: a byte-budgeted working set in RAM with the
+    source as backing. Evicted experts are re-fetched from the source on
+    the next miss; placement never changes the returned values (D5).
+
+    Duck-types the subset of ExpertBank that ExpertSlotPool uses
+    (__getitem__, bytes, __contains__, keys, __len__), so a slot pool
+    built over this bank gets the three-tier story for free.
+
+    Single-threaded by design: nothing is pinned, because the caller
+    (ExpertSlotPool._load) copies the returned ExpertWeights to GPU
+    synchronously — no eviction can interleave with a live reference.
+    Eviction is pure LRU.
+    """
+
+    def __init__(self, source, budget_bytes: int, per_expert_bytes: int) -> None:
+        self.source = source
+        self.budget_bytes = budget_bytes
+        self.per_expert_bytes = per_expert_bytes
+        self._cache: OrderedDict[tuple[int, int], ExpertWeights] = OrderedDict()
+        self._used = 0
+        self.hits = 0
+        self.misses = 0
+
+    def __getitem__(self, key: tuple[int, int]) -> ExpertWeights:
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            self.hits += 1
+        else:
+            w = self.source.expert(*key)
+            nbytes = w.bytes()
+            assert nbytes == self.per_expert_bytes, (
+                f"non-uniform expert {key}: {nbytes}B != "
+                f"{self.per_expert_bytes}B")
+            assert nbytes <= self.budget_bytes, (
+                f"host expert LRU budget too small for one expert: "
+                f"{nbytes}B > {self.budget_bytes}B")
+            self._evict_to_fit(nbytes)
+            self._cache[key] = w
+            self._used += nbytes
+            self.misses += 1
+        return self._cache[key]
+
+    def _evict_to_fit(self, nbytes: int) -> None:
+        while self._cache and self._used + nbytes > self.budget_bytes:
+            _, w = self._cache.popitem(last=False)
+            self._used -= w.bytes()
+
+    def bytes(self, key: tuple[int, int]) -> int:
+        return self.per_expert_bytes
+
+    def __contains__(self, key: tuple[int, int]) -> bool:
+        return key in self._cache
+
+    def keys(self):
+        return self._cache.keys()
+
+    def __len__(self) -> int:
+        return len(self._cache)
+
+    @property
+    def hit_rate(self) -> float:
+        total = self.hits + self.misses
+        return self.hits / total if total else 0.0
 
 
 class ExpertSlotPool:

@@ -23,6 +23,7 @@ from pathlib import Path
 from safetensors import safe_open
 import torch
 
+from ..store.experts import ExpertWeights
 from .layout import LayoutIndex
 
 
@@ -38,9 +39,17 @@ class DiskLayerSource:
         self.layout = layout
 
     def layer(self, layer_idx: int) -> dict[str, torch.Tensor]:
-        """Read one layer's tensors (a sequential read of one file)."""
+        """Read one layer's *dense* tensors (a sequential read of one file).
+
+        Expert tensors are excluded: they share the same per-layer file
+        but are served separately through DiskExpertSource (the host-LRU
+        / disk tier). Dense consumers (DenseWindow, the MoE engine's
+        _load_dense) must not pull every expert into memory — for the
+        real model that is the whole 57GB expert block.
+        """
         file_name = self.layout.layer_file(layer_idx)
-        names = self.layout.layer_tensor_names(layer_idx)
+        names = [n for n in self.layout.layer_tensor_names(layer_idx)
+                 if ".experts." not in n]
         with safe_open(str(self.dir / file_name), framework="pt") as f:
             return {n: f.get_tensor(n) for n in names}
 
@@ -52,6 +61,38 @@ class DiskLayerSource:
         names = self.layout.shared_tensor_names()
         with safe_open(str(self.dir / file_name), framework="pt") as f:
             return {n: f.get_tensor(n) for n in names}
+
+
+class DiskExpertSource:
+    """Serves one expert's w1/w2/w3 from the per-layer safetensors file.
+
+    Reads the three per-expert tensors by name (the layout's canonical
+    names), so only that expert's bytes are paged in (mmap-backed).
+    This is the disk tier behind the host expert LRU (HOST_FIRST).
+    """
+
+    def __init__(self, model_dir: str | Path, layout: LayoutIndex) -> None:
+        self.dir = Path(model_dir)
+        self.layout = layout
+
+    def expert(self, layer_idx: int, expert_id: int) -> ExpertWeights:
+        file_name = self.layout.layer_file(layer_idx)
+        names = self.layout.expert_tensor_names(layer_idx, expert_id)
+        with safe_open(str(self.dir / file_name), framework="pt") as f:
+            w1 = f.get_tensor(names[0])
+            w2 = f.get_tensor(names[1])
+            w3 = f.get_tensor(names[2])
+        return ExpertWeights(w1=w1, w2=w2, w3=w3)
+
+
+class DictExpertSource:
+    """Serves experts from a resident ExpertBank (HOST anchor / tests)."""
+
+    def __init__(self, bank) -> None:
+        self.bank = bank
+
+    def expert(self, layer_idx: int, expert_id: int) -> ExpertWeights:
+        return self.bank[(layer_idx, expert_id)]
 
 
 class DictLayerSource:

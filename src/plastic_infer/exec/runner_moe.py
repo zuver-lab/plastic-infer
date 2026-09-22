@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 
 from ..store.experts import ExpertSlotPool
-from .attention import build_rope_cache, rms_norm, rope_positions
+from .attention import build_rope_cache, qk_norm, rms_norm, rope_positions
 from .moe import moe_forward_sparse, topk_route
 from .runner import DenseKVCache, DenseWeights, ModelConfig, linear
 
@@ -53,11 +53,17 @@ def _moe_ffn(x: torch.Tensor, weights: DenseWeights, pool: ExpertSlotPool,
     eids, routing_w = topk_route(router_logits, config.n_experts_per_tok)
 
     unique = eids.reshape(-1).unique().tolist()
-    exp = pool.ensure(layer_idx, unique)
-    try:
-        moe_out = moe_forward_sparse(xf, exp, eids, routing_w)
-    finally:
-        pool.release(layer_idx, unique)
+    # Serve one routed expert at a time and accumulate, so the GPU pool
+    # never needs to hold more than a single expert (D5): a layer can
+    # route more distinct experts than the budget fits (long prompts on
+    # the real model), and eviction can't reclaim pinned pages (D7).
+    moe_out = torch.zeros_like(xf)
+    for eid in unique:
+        exp = pool.ensure(layer_idx, [eid])
+        try:
+            moe_out += moe_forward_sparse(xf, exp, eids, routing_w)
+        finally:
+            pool.release(layer_idx, [eid])
 
     return moe_out.reshape(1, T, config.hidden_dim)
 
@@ -91,6 +97,12 @@ def prefill_forward_moe(
         q = q.view(1, seq_len, config.n_heads, config.head_dim)
         k = k.view(1, seq_len, config.n_kv_heads, config.head_dim)
         v = v.view(1, seq_len, config.n_kv_heads, config.head_dim)
+        if config.qk_norm:
+            q, k = qk_norm(
+                q, k,
+                weights[f"layers.{layer_idx}.self_attn.q_norm.weight"],
+                weights[f"layers.{layer_idx}.self_attn.k_norm.weight"],
+                config.head_dim)
         q = rope_positions(cos, sin, positions, q)
         k = rope_positions(cos, sin, positions, k)
 
@@ -143,6 +155,12 @@ def decode_step_moe(
         q = q.view(1, 1, config.n_heads, config.head_dim)
         k = k.view(1, 1, config.n_kv_heads, config.head_dim)
         v = v.view(1, 1, config.n_kv_heads, config.head_dim)
+        if config.qk_norm:
+            q, k = qk_norm(
+                q, k,
+                weights[f"layers.{layer_idx}.self_attn.q_norm.weight"],
+                weights[f"layers.{layer_idx}.self_attn.k_norm.weight"],
+                config.head_dim)
         q = rope_positions(cos, sin, pos_tensor, q)
         k = rope_positions(cos, sin, pos_tensor, k)
 

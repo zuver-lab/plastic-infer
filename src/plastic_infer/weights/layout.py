@@ -98,6 +98,10 @@ class LayoutIndex:
     def layer_tensor_names(self, layer_idx: int) -> list[str]:
         return list(self._layer_tensors[layer_idx])
 
+    def expert_tensor_names(self, layer_idx: int, expert_id: int) -> list[str]:
+        """Canonical names of one expert's tensors (w1/w2/w3, in order)."""
+        return list(self._expert_tensors[layer_idx][expert_id])
+
     def layer_total_bytes(self, layer_idx: int) -> int:
         return sum(self._tensor_map[n].nbytes
                    for n in self._layer_tensors[layer_idx])

@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from plastic_infer.exec.attention import (
     build_rope_cache,
     gather_paged_kv,
+    host_stream_attention_v1,
     paged_attention_v1,
     rms_norm,
     rope_positions,
@@ -438,3 +439,106 @@ class TestSparseMoEForward:
         sparse = moe_forward_sparse(hidden, subset, eids, weights)
         full = moe_forward_sparse(hidden, experts, eids, weights)
         assert torch.allclose(sparse, full, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Host-stream attention (M3, optional long-sequence primitive)
+# ---------------------------------------------------------------------------
+
+class TestHostStreamAttention:
+    """host_stream_attention_v1 == attention over the full contiguous KV.
+
+    The causal-with-offset mask semantics (kv_pos <= q_pos) are already
+    anchored end-to-end by the prefix-reuse tests; these tests pin the
+    new part: chunk order / permutation / concat and GQA expansion.
+    """
+
+    def _setup(self, seed: int, *, total_kv: int, host_len: int,
+               chunk_size: int, n_heads: int = 4, n_kv_heads: int = 2,
+               head_dim: int = 16):
+        """Split a contiguous KV into host chunks + resident tail."""
+        torch.manual_seed(seed)
+        k_full = torch.randn(1, total_kv, n_kv_heads, head_dim) * 0.1
+        v_full = torch.randn(1, total_kv, n_kv_heads, head_dim) * 0.1
+
+        host_chunks: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for start in range(0, host_len, chunk_size):
+            end = min(start + chunk_size, host_len)
+            # [H_kv, D, C] (the host chunk layout)
+            k_c = k_full[0, start:end].permute(1, 2, 0).contiguous()
+            v_c = v_full[0, start:end].permute(1, 2, 0).contiguous()
+            host_chunks.append((k_c, v_c))
+        resident_k = k_full[:, host_len:]
+        resident_v = v_full[:, host_len:]
+        return k_full, v_full, host_chunks, resident_k, resident_v
+
+    def _reference(self, q, k_full, v_full, q_start_pos: int,
+                   causal: bool) -> torch.Tensor:
+        """Contiguous SDPA with the same causal-offset semantics."""
+        q_len, kv_len = q.shape[1], k_full.shape[1]
+        H, H_kv = q.shape[2], k_full.shape[2]
+        q_t = q.transpose(1, 2)
+        k_t = k_full.transpose(1, 2).repeat_interleave(H // H_kv, dim=1)
+        v_t = v_full.transpose(1, 2).repeat_interleave(H // H_kv, dim=1)
+        if causal and (q_start_pos > 0 or q_len != kv_len):
+            q_pos = torch.arange(q_start_pos, q_start_pos + q_len)
+            kv_pos = torch.arange(kv_len)
+            mask = kv_pos[None, :] <= q_pos[:, None]
+            attn_mask = torch.zeros(q_len, kv_len, dtype=q.dtype)
+            attn_mask = attn_mask.masked_fill(~mask, float("-inf"))
+            out = F.scaled_dot_product_attention(
+                q_t, k_t, v_t, attn_mask=attn_mask[None, None])
+        else:
+            out = F.scaled_dot_product_attention(
+                q_t, k_t, v_t, is_causal=causal)
+        return out.transpose(1, 2)
+
+    def test_full_tail_prefill_matches_contiguous(self) -> None:
+        """New tokens appended past a host-streamed KV prefix."""
+        kv_full, v_full, chunks, rk, rv = self._setup(
+            1, total_kv=10, host_len=6, chunk_size=3)
+        q = torch.randn(1, 2, 4, 16) * 0.1     # 2 new tokens at positions 10,11
+        q_start_pos = 10
+
+        out = host_stream_attention_v1(q, chunks, rk, rv,
+                                       q_start_pos=q_start_pos)
+        ref = self._reference(q, kv_full, v_full, q_start_pos, causal=True)
+        assert torch.allclose(out, ref, atol=1e-4), (
+            f"max diff = {(out - ref).abs().max().item():.6f}")
+
+    def test_decode_step_matches_contiguous(self) -> None:
+        kv_full, v_full, chunks, rk, rv = self._setup(
+            2, total_kv=8, host_len=5, chunk_size=4)
+        q = torch.randn(1, 1, 4, 16) * 0.1     # one token at position 8
+        q_start_pos = 8
+
+        out = host_stream_attention_v1(q, chunks, rk, rv,
+                                       q_start_pos=q_start_pos)
+        ref = self._reference(q, kv_full, v_full, q_start_pos, causal=True)
+        assert torch.allclose(out, ref, atol=1e-4)
+
+    def test_offset_query_attends_suffix(self) -> None:
+        """q positions inside the KV range (recompute of a partial tail)."""
+        kv_full, v_full, chunks, rk, rv = self._setup(
+            3, total_kv=8, host_len=4, chunk_size=2)
+        q = torch.randn(1, 2, 4, 16) * 0.1     # positions 5,6
+        q_start_pos = 5
+
+        out = host_stream_attention_v1(q, chunks, rk, rv,
+                                       q_start_pos=q_start_pos)
+        ref = self._reference(q, kv_full, v_full, q_start_pos, causal=True)
+        assert torch.allclose(out, ref, atol=1e-4)
+
+    def test_all_resident_no_chunks(self) -> None:
+        """No host chunks: degenerate case == plain contiguous causal SDPA."""
+        kv_full, v_full, _, rk, rv = self._setup(
+            4, total_kv=6, host_len=6, chunk_size=3)
+        # resident covers everything; chunks list is empty
+        rk = kv_full
+        rv = v_full
+        q = kv_full.clone()                  # q_len == kv_len, q_start_pos == 0
+        q = q.repeat_interleave(2, dim=2)    # [1, 6, 4, 16] GQA already exercised
+
+        out = host_stream_attention_v1(q, [], rk, rv, q_start_pos=0)
+        ref = self._reference(q, kv_full, v_full, 0, causal=True)
+        assert torch.allclose(out, ref, atol=1e-4)

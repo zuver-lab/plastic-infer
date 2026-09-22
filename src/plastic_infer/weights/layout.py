@@ -84,6 +84,17 @@ class LayoutIndex:
     def layer_file(self, layer_idx: int) -> str:
         return self._layer_files[layer_idx]
 
+    def shared_file(self) -> str | None:
+        """File name holding the non-layer tensors (embed/norm/lm_head)."""
+        return self._shared_file
+
+    def shared_tensor_names(self) -> list[str]:
+        """Names of the tensors stored in the shared file."""
+        if self._shared_file is None:
+            return []
+        return [n for n, loc in self._tensor_map.items()
+                if loc.file == self._shared_file]
+
     def layer_tensor_names(self, layer_idx: int) -> list[str]:
         return list(self._layer_tensors[layer_idx])
 

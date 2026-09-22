@@ -165,3 +165,63 @@ def paged_attention_v1(
 
     out = F.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=causal)
     return out.transpose(1, 2)     # back to [1, S_q, H, D]
+
+
+def host_stream_attention_v1(
+    q: torch.Tensor,                    # [1, q_len, n_heads, head_dim]
+    host_chunks: list[tuple[torch.Tensor, torch.Tensor]],
+    # [(k_c, v_c)] each [n_kv_heads, head_dim, C], oldest chunk first;
+    # together they cover positions [0, host_len)
+    resident_k: torch.Tensor,           # [1, R, n_kv_heads, head_dim] (GPU tail)
+    resident_v: torch.Tensor,           # [1, R, n_kv_heads, head_dim]
+    q_start_pos: int = 0,
+    causal: bool = True,
+) -> torch.Tensor:
+    """Attention over KV split between host chunks and a GPU-resident tail.
+
+    This is the long-sequence HOST_STREAM primitive (M3, optional
+    switch): when a request's KV outgrows the GPU page pool, completed
+    chunks are sunk to host and only a recent tail stays resident. This
+    op materializes host chunks + resident tail into one contiguous
+    buffer, then SDPA — a correctness-first v1. A flash-incremental
+    kernel that reads host chunks without materializing is a later
+    swap behind the same interface.
+
+    `q` rows are at global positions [q_start_pos, q_start_pos + q_len);
+    the KV covers positions [0, host_len + R). Causal masking matches
+    _attn_paged: Q[i] attends to KV[0 : q_start_pos + i + 1].
+    """
+    # [n_kv_heads, head_dim, C] -> [C, n_kv_heads, head_dim], oldest first
+    k_parts = [k_c.permute(2, 0, 1) for k_c, _ in host_chunks]
+    v_parts = [v_c.permute(2, 0, 1) for _, v_c in host_chunks]
+    # host_chunks is empty when everything is resident
+    k_full = torch.cat(k_parts + [resident_k[0]], dim=0).unsqueeze(0)
+    v_full = torch.cat(v_parts + [resident_v[0]], dim=0).unsqueeze(0)
+
+    q_len = q.shape[1]
+    kv_len = k_full.shape[1]
+
+    q_t = q.transpose(1, 2)            # [1, H, Q, D]
+    k_t = k_full.transpose(1, 2)       # [1, H_kv, KV, D]
+    v_t = v_full.transpose(1, 2)
+    n_heads = q_t.shape[1]
+    n_kv_heads = k_t.shape[1]
+    if n_heads != n_kv_heads:
+        assert n_heads % n_kv_heads == 0
+        n_groups = n_heads // n_kv_heads
+        k_t = k_t.repeat_interleave(n_groups, dim=1)
+        v_t = v_t.repeat_interleave(n_groups, dim=1)
+
+    if causal and (q_start_pos > 0 or q_len != kv_len):
+        device = q.device
+        q_pos = torch.arange(q_start_pos, q_start_pos + q_len, device=device)
+        kv_pos = torch.arange(kv_len, device=device)
+        mask = kv_pos[None, :] <= q_pos[:, None]        # [Q, KV]
+        attn_mask = torch.zeros(q_len, kv_len, dtype=q.dtype, device=device)
+        attn_mask = attn_mask.masked_fill(~mask, float("-inf"))
+        attn_mask = attn_mask[None, None, :, :]
+        out = F.scaled_dot_product_attention(
+            q_t, k_t, v_t, attn_mask=attn_mask)
+    else:
+        out = F.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=causal)
+    return out.transpose(1, 2)         # [1, Q, H, D]

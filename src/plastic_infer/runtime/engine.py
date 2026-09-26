@@ -127,6 +127,17 @@ class Engine:
         plan = MemoryPlanner().plan(self.profile, self.model, req)
         b = pool_budgets(plan, self.model)
 
+        # The planner sizes a *rotating* dense window on the GPU, but this
+        # engine keeps every dense weight resident on the device (a HOST
+        # source is read once and copied over). Charge that overhang to the
+        # expert slot pool so dense + experts + KV still fit in HBM —
+        # otherwise the expert LRU would be free to grow into the space the
+        # dense weights occupy.
+        per_expert = self.layout.expert_total_bytes(0)
+        expert_slots_bytes = max(
+            per_expert, b.expert_slots_bytes
+            - max(0, self.model.dense_bytes - b.dense_window_bytes))
+
         if plan.seq_weight_source != "HOST":
             raise NotImplementedError(
                 f"MoE engine requires dense weights in host RAM (plan says "
@@ -141,11 +152,10 @@ class Engine:
 
         weights = self._load_dense()
 
-        per_expert = self.layout.expert_total_bytes(0)
         host = HostExpertLru(self.expert_src,
                              budget_bytes=plan.expert_host_slots * per_expert,
                              per_expert_bytes=per_expert)
-        pool = ExpertSlotPool(host, b.expert_slots_bytes, device=self.device)
+        pool = ExpertSlotPool(host, expert_slots_bytes, device=self.device)
 
         kv_cfg = make_kv_config(
             self.config,

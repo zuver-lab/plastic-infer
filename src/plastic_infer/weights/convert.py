@@ -11,9 +11,13 @@ per-layer format consumed by DiskLayerSource / DiskExpertSource:
 
 Name mapping (HF -> canonical, see map_hf_tensor):
   - router:  mlp.gate.weight  ->  mlp.router.weight  (runner uses router)
-  - experts: fused 3D gate_up_proj / down_proj are split per expert into
-    layers.{L}.mlp.experts.{eid}.{w1,w2,w3}.weight, where w1 = gate
-    (first moe_intermediate_size rows), w3 = up (rest), w2 = down.
+  - experts: -> layers.{L}.mlp.experts.{eid}.{w1,w2,w3}.weight, where
+    w1 = gate, w3 = up, w2 = down. Two on-disk layouts exist and both are
+    handled:
+      * released checkpoints store per-expert 2D tensors
+        experts.{eid}.{gate,up,down}_proj.weight -> renamed w1/w3/w2
+      * transformers' in-memory modules fuse them into 3D
+        experts.gate_up_proj / experts.down_proj -> split per expert
 
 Memory-controlled: every HF tensor is read through safe_open (mmap), so
 only the bytes actually sliced are paged in; at most one layer's weights
@@ -23,6 +27,7 @@ only the bytes actually sliced are paged in; at most one layer's weights
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -33,25 +38,37 @@ from safetensors.torch import save_file
 from ..store.experts import ExpertWeights
 from .layout import build_layout_from_manifest
 
-_DENSE_FUSED_EXPERTS = (".mlp.experts.gate_up_proj", ".mlp.experts.down_proj")
+_FUSED_EXPERT_MARK = ".mlp.experts.gate_up_proj"
+_EXPERTS_MARK = ".mlp.experts."
 _SHARED_HF_NAMES = ("model.embed_tokens.weight", "model.norm.weight",
                     "lm_head.weight")
+
+# Released checkpoints: model.layers.{L}.mlp.experts.{eid}.{gate,up,down}_proj.weight
+_EXPERT_PROJ_RE = re.compile(
+    r"^layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.weight$")
+_EXPERT_TAG = {"gate": "w1", "down": "w2", "up": "w3"}
 
 
 def map_hf_tensor(hf_name: str) -> str | None:
     """Map an HF Qwen3Moe tensor name to our canonical name.
 
-    Returns None for the fused expert tensors (gate_up_proj /
-    down_proj), which are split per-expert by the converter loop.
+    Returns None for the fused 3D expert tensors (gate_up_proj /
+    down_proj), which are split per-expert by split_expert instead of
+    being renamed. Per-expert 2D tensors (the released-checkpoint
+    layout) are renamed to w1/w3/w2 here.
     """
     if hf_name == "lm_head.weight" or hf_name.startswith("model.embed_tokens.weight") \
             or hf_name.startswith("model.norm.weight"):
         return hf_name.removeprefix("model.")
-    if hf_name.startswith("model.layers.") and not any(
-            f in hf_name for f in _DENSE_FUSED_EXPERTS):
+    if hf_name.startswith("model.layers.") and _FUSED_EXPERT_MARK not in hf_name \
+            and ".mlp.experts.down_proj" not in hf_name:
         out = hf_name.removeprefix("model.")        # layers.{L}....
         if ".mlp.gate.weight" in out:               # router rename
             return out.replace(".mlp.gate.weight", ".mlp.router.weight")
+        m = _EXPERT_PROJ_RE.match(out)              # per-expert rename
+        if m:
+            return (f"layers.{m.group(1)}.mlp.experts.{m.group(2)}."
+                    f"{_EXPERT_TAG[m.group(3)]}.weight")
         return out
     return None
 
@@ -88,11 +105,14 @@ class _DictSource:
     def __init__(self, flat: dict[str, torch.Tensor]) -> None:
         self.flat = flat
 
+    def all_names(self) -> list[str]:
+        return list(self.flat)
+
     def layer_dense_names(self, layer: int) -> list[str]:
         prefix = f"model.layers.{layer}."
         return sorted(
             n for n in self.flat
-            if n.startswith(prefix) and not any(f in n for f in _DENSE_FUSED_EXPERTS)
+            if n.startswith(prefix) and _EXPERTS_MARK not in n
         )
 
     def shared_names(self) -> list[str]:
@@ -124,11 +144,14 @@ class _ShardSource:
             self._handles[shard] = safe_open(str(self.dir / shard), framework="pt")
         return self._handles[shard]
 
+    def all_names(self) -> list[str]:
+        return list(self.weight_map)
+
     def layer_dense_names(self, layer: int) -> list[str]:
         prefix = f"model.layers.{layer}."
         return sorted(
             n for n in self.weight_map
-            if n.startswith(prefix) and not any(f in n for f in _DENSE_FUSED_EXPERTS)
+            if n.startswith(prefix) and _EXPERTS_MARK not in n
         )
 
     def shared_names(self) -> list[str]:
@@ -151,6 +174,7 @@ def _convert_layers(source, config: dict, out_dir: Path, dtype: torch.dtype) -> 
     n_layers = config["num_hidden_layers"]
     n_experts = config["num_experts"]
     inter = config["moe_intermediate_size"]
+    fused = any(_FUSED_EXPERT_MARK in n for n in source.all_names())
     out_dir.mkdir(parents=True, exist_ok=True)
 
     per_layer_dense: dict[str, int] = {}
@@ -165,12 +189,28 @@ def _convert_layers(source, config: dict, out_dir: Path, dtype: torch.dtype) -> 
             per_layer_dense[canon.split(".", 2)[2]] = \
                 t.numel() * t.element_size()
 
-        gu_name = f"model.layers.{layer}.mlp.experts.gate_up_proj"
-        dn_name = f"model.layers.{layer}.mlp.experts.down_proj"
-        for eid in range(n_experts):
-            w1 = source.expert_row(gu_name, eid)[:inter].contiguous().to(dtype)
-            w3 = source.expert_row(gu_name, eid)[inter:].contiguous().to(dtype)
-            w2 = source.expert_row(dn_name, eid).to(dtype)
+        # One (w1=gate, w2=down, w3=up) triple per expert, from whichever
+        # layout this checkpoint uses.
+        if fused:
+            gu_name = f"model.layers.{layer}.mlp.experts.gate_up_proj"
+            dn_name = f"model.layers.{layer}.mlp.experts.down_proj"
+            expert_ws = [
+                (source.expert_row(gu_name, eid)[:inter].contiguous().to(dtype),
+                 source.expert_row(dn_name, eid).to(dtype),
+                 source.expert_row(gu_name, eid)[inter:].contiguous().to(dtype))
+                for eid in range(n_experts)
+            ]
+        else:
+            expert_ws = []
+            for eid in range(n_experts):
+                p = f"model.layers.{layer}.mlp.experts.{eid}"
+                expert_ws.append((
+                    source.get(f"{p}.gate_proj.weight").contiguous().to(dtype),
+                    source.get(f"{p}.down_proj.weight").contiguous().to(dtype),
+                    source.get(f"{p}.up_proj.weight").contiguous().to(dtype),
+                ))
+
+        for eid, (w1, w2, w3) in enumerate(expert_ws):
             for tag, t in (("w1", w1), ("w2", w2), ("w3", w3)):
                 layer_dict[f"layers.{layer}.mlp.experts.{eid}.{tag}.weight"] = t
             if eid == 0:

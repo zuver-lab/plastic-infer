@@ -25,3 +25,6 @@ venv/
 *.bin
 *.pt
 *.pth
+
+# Downloaded model dirs (weights + shards + logs)
+models/

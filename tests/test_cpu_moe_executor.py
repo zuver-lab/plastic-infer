@@ -208,3 +208,73 @@ def test_cpu_locked_decode_matches_hf(
     finally:
         del cache
         torch.cuda.empty_cache()
+
+
+# ---------------------------------------------------------------------------
+# Part 3 -- hybrid pageable fetch (WSL: unpinned banks, no device alias)
+# ---------------------------------------------------------------------------
+
+def _make_pageable_hybrid_cache(L: int, E: int, H: int, I: int, cache_size: int,
+                                device: torch.device):
+    """A ``decode_target="hybrid"`` cache whose banks are pageable (no device
+    alias): every decode fetch must go through ``copy_missing``'s pageable
+    gather. Mirrors the engine's WSL outcome -- pin budget << one layer's bank,
+    so no bank is registered and no layer is a pure CPU layer."""
+    gate_up = torch.empty(L * E, 2 * I, H, dtype=torch.bfloat16)
+    down = torch.empty(L * E, H, I, dtype=torch.bfloat16)
+    gate_up.normal_().mul_(0.1)
+    down.normal_().mul_(0.1)
+    cache = OffloadMoeCache(
+        num_layers=L, num_experts=E, cache_size=cache_size,
+        device=device, quant_format="bf16", decode_target="hybrid",
+    )
+    from plastic_infer.moe.host_banks import HostResidency
+
+    cache.cpu_layer_ids = frozenset()  # no CPU-only layers: every layer is hybrid
+    cache.set_bank_sources(
+        {"gate_up": list(gate_up.split(E)), "down": list(down.split(E))},
+        layer_residency=[HostResidency.LOCKED.value] * L,
+    )
+    assert len(cache._unpinned_layers) == L
+    return cache, gate_up, down
+
+
+def test_hybrid_pageable_fetch_matches_gpu_kernel() -> None:
+    """Hybrid decode over unpinned (pageable) banks: the staged misses are
+    gathered on the host into their LRU slots (``copy_missing``'s pageable
+    branch) and the overflow runs on the CPU executor; the merged output must
+    equal the GPU fused kernel on identical banks."""
+    from plastic_infer.exec.runner_moe import _decode_hybrid
+    from plastic_infer.moe.cpu_executor import CpuMoeExecutor
+    from plastic_infer.moe.fused import fused_experts_decode_impl
+    from plastic_infer.moe.host_banks import HostResidency
+
+    torch.manual_seed(11)
+    L, E, H, I, top_k = 2, 8, 256, 128, 4
+    dev = require_cuda()
+    cache, gate_up, down = _make_pageable_hybrid_cache(
+        L, E, H, I, cache_size=E, device=dev)
+    cache.hybrid_max_fetch = 2  # cap below the miss count so the CPU executor runs
+    ex = CpuMoeExecutor(cache, top_k=top_k, activation="silu",
+                        apply_router_weight_on_input=False,
+                        num_threads=0, max_tokens=1, device=dev)
+    cache.set_cpu_executor(ex)
+    layer = 1
+    try:
+        for step in range(3):
+            cache.reset()  # fresh empty mapping: every active expert is a miss
+            hidden = torch.randn(1, H, device=dev, dtype=torch.bfloat16) * 0.1
+            ids = torch.stack([torch.randperm(E, device=dev)[:top_k]
+                               for _ in range(1)]).to(torch.int32)
+            w = torch.rand(1, top_k, device=dev)
+            out = _decode_hybrid(cache, layer, hidden, w, ids.clone()).float()
+            torch.cuda.synchronize()
+            gu = gate_up.split(E)[layer].to(dev)
+            dn = down.split(E)[layer].to(dev)
+            ref = fused_experts_decode_impl(
+                hidden, gu, dn, w, ids.clone(), "silu", False).float()
+            rel = (out - ref).abs().max() / (ref.abs().max() + 1e-6)
+            assert rel < 2e-2, f"step {step}: rel err {rel.item()}"
+    finally:
+        del cache, ex
+        torch.cuda.empty_cache()

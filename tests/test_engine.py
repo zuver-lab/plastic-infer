@@ -178,6 +178,31 @@ class TestEngineEquivalence:
             f"hybrid decode {result.tokens[len(prompt):]} != HF "
             f"{hf_ids[0, len(prompt):].tolist()}")
 
+    def test_hybrid_pageable_fetch(self, model_dir, hf_model, monkeypatch) -> None:
+        """Under hybrid, a pin budget below the banks no longer forces CPU-only
+        layers: every layer stays hybrid-eligible (cpu_layer_ids empty) with its
+        bank LOCKED/PAGEABLE, and greedy decode still matches HF through
+        copy_missing's pageable fetch."""
+        monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", "0.000001")
+        eng = Engine(model_dir[0], _profile(), device=require_cuda())
+        torch.manual_seed(34)
+        prompt = torch.randint(0, eng.config.vocab_size, (8,)).tolist()
+        n_gen = 4
+        result = eng.run(prompt, max_new_tokens=n_gen)  # builds the MoE cache
+        cache = eng._moe_cache
+        assert cache is not None
+        assert cache.decode_target == "hybrid"
+        assert cache.cpu_layer_ids == frozenset()
+        assert len(cache._unpinned_layers) == eng.config.n_layers
+
+        with torch.no_grad():
+            hf_ids = hf_model.generate(
+                torch.tensor([prompt], device=hf_model.device),
+                max_new_tokens=n_gen, do_sample=False, use_cache=True)
+        assert result.tokens[len(prompt):] == hf_ids[0, len(prompt):].tolist(), (
+            f"hybrid pageable decode {result.tokens[len(prompt):]} != HF "
+            f"{hf_ids[0, len(prompt):].tolist()}")
+
     def test_stream_timing_and_run_equivalence(self, engine: Engine) -> None:
         """stream() yields one (token, elapsed) per generated token with
         non-decreasing elapsed, and run() (which drains it) gives the

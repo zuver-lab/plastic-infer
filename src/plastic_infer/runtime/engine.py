@@ -165,9 +165,10 @@ def _pin_budget_bytes() -> int | None:
 
 
 def _resolve_cpu_layers() -> frozenset[int]:
-    """MoE layer ids whose decode runs on the CPU executor. PlasticInfer has no
-    per-backend config knobs (offload is the only backend), so an explicit set is
-    never requested -- the auto resolution in the engine is the mechanism."""
+    """MoE layer ids whose decode runs entirely on the CPU executor (offload
+    path). Under hybrid every layer is hybrid-eligible and pageable fetch serves
+    the unpinned ones, so this set stays empty there. No CLI knob requests an
+    explicit set today -- the auto resolution in the engine is the mechanism."""
     return frozenset()
 
 
@@ -253,59 +254,85 @@ class Engine:
         """Build (once) the FreeToken offload-MoE cache for this model.
 
         Wires banks -> slot cache exactly as FreeToken's engine does: resolve the
-        CPU-locked layer set (auto, when the pinned banks exceed the WSL pin
-        budget), load all expert banks into host with the matching residency, then
-        construct the cache with ``cpu_layer_ids`` set BEFORE ``set_bank_sources``
-        (the residency validation and the copy plan's skip of non-pinned layers
-        key on that set). ``decode_target`` picks the per-decode mechanism: "gpu"
-        is plain offload, "cpu" routes the locked layers to the CPU executor.
+        backend (hybrid by default) and the CPU-locked layer set (offload
+        auto-lock, when the pinned banks exceed the WSL pin budget), load all
+        expert banks into host with the matching residency, then construct the
+        cache with ``cpu_layer_ids`` set BEFORE ``set_bank_sources`` (the residency
+        validation and the copy plan's skip of non-pinned layers key on that set).
+        ``decode_target`` picks the per-decode mechanism: "hybrid" is GPU slot-cache
+        + CPU-overflow co-compute (unpinned layers fetch via ``copy_missing``'s
+        pageable gather), "cpu" routes the locked layers to the CPU executor, "gpu"
+        is plain GPU offload.
         """
         num_moe_layers = self.config.n_layers
-        cpu_layer_ids = _resolve_cpu_layers()
-        if not cpu_layer_ids and _pin_budget_bytes() is not None:
-            # FreeToken sizes this as layers * experts * per-expert
-            # (bank_bytes_estimate); expert_total_bytes is one expert's rows.
-            bank_bytes = sum(self.layout.expert_total_bytes(l) *
-                             self.layout.num_experts(l)
-                             for l in range(num_moe_layers))
-            cpu_layer_ids = _auto_cpu_layers(num_moe_layers, bank_bytes)
+        # FreeToken sizes this as layers * experts * per-expert
+        # (bank_bytes_estimate); expert_total_bytes is one expert's rows.
+        bank_bytes = sum(self.layout.expert_total_bytes(l) *
+                         self.layout.num_experts(l)
+                         for l in range(num_moe_layers))
         # backend (FreeToken --moe-backend, default hybrid): the CPU executor
         # computes each step's overflow misses while the GPU computes the cache
         # hits + the bandwidth-matched fetched share. FREETOKEN_MOE_BACKEND=offload
         # restores plain GPU offload; =auto applies FreeToken's hardware gate
         # (offload -> hybrid only when the CPU MoE bw clears the PCIe gather bw
-        # by the bench threshold). CPU-locked layers still override at decode
-        # (is_cpu_layer wins), exactly like FreeToken.
+        # by the bench threshold).
         backend = os.environ.get("FREETOKEN_MOE_BACKEND", "hybrid").strip().lower()
         if backend == "hybrid":
-            decode_target = "hybrid"
+            hybrid = True
         elif backend == "auto":
             from ..moe.bandwidth import probe
             p = probe(self.device, self.config.n_experts, self.config.hidden_dim,
                       self.config.intermediate_dim, self.config.n_experts_per_tok)
-            decode_target = ("hybrid" if (p and p["recommended"] == "hybrid")
-                             else "cpu" if cpu_layer_ids else "gpu")
+            hybrid = bool(p and p["recommended"] == "hybrid")
         else:  # "offload" (or anything unknown)
-            decode_target = "cpu" if cpu_layer_ids else "gpu"
+            hybrid = False
         # a default hybrid boot degrades to GPU offload when the CPU executor cannot
         # serve this model (an explicit FREETOKEN_MOE_BACKEND=hybrid fails loudly in
         # the executor build instead).
-        if decode_target == "hybrid" and not _cpu_moe_executor_viable():
+        if hybrid and not _cpu_moe_executor_viable():
             logger.info(
                 "moe backend hybrid defaulted but the CPU MoE executor cannot serve "
                 "this model; using plain GPU offload")
-            decode_target = "gpu"
-        # split residency: where pinning is quota-capped (_pin_budget_bytes), pin
-        # only the GPU layers' banks and mlock the CPU layers'.
-        split_residency = bool(cpu_layer_ids) and _pin_budget_bytes() is not None
+            hybrid = False
+        cpu_layer_ids = _resolve_cpu_layers()
+        if hybrid:
+            decode_target = "hybrid"
+        else:
+            # offload semantics (FreeToken): CPU-locked layers when the banks
+            # exceed the pin budget; is_cpu_layer wins over "gpu" at decode.
+            if not cpu_layer_ids and _pin_budget_bytes() is not None:
+                cpu_layer_ids = _auto_cpu_layers(num_moe_layers, bank_bytes)
+            decode_target = "cpu" if cpu_layer_ids else "gpu"
+        # residency: which banks get a device address. Offload pins every bank and
+        # OS-locks the CPU layers (resident for the executor, unregistered). Hybrid
+        # pins the layers whose full banks fit the pin budget (device-side fused
+        # fetch); the rest stay LOCKED/PAGEABLE but hybrid-eligible -- their decode
+        # fetch goes through copy_missing's pageable gather, whose pinned staging is
+        # bounded by the per-step fetch count, not the bank size. A capped pin budget
+        # therefore no longer forces every layer onto the CPU executor (FreeToken's
+        # WSL all-locked outcome); hybrid keeps the GPU slot cache in play per layer.
+        budget = _pin_budget_bytes()
+        split_residency = False
         requested_residency = None
-        if split_residency:
-            from ..moe.host_banks import HostResidency
-            requested_residency = [
-                HostResidency.LOCKED.value if i in cpu_layer_ids
-                else HostResidency.PINNED.value
-                for i in range(num_moe_layers)
-            ]
+        if hybrid:
+            if budget is not None and bank_bytes > budget:
+                pinnable = int(budget // (bank_bytes / num_moe_layers))
+                from ..moe.host_banks import HostResidency
+                requested_residency = [
+                    HostResidency.PINNED.value if i < pinnable
+                    else HostResidency.LOCKED.value
+                    for i in range(num_moe_layers)
+                ]
+                split_residency = True
+        else:
+            split_residency = bool(cpu_layer_ids) and budget is not None
+            if split_residency:
+                from ..moe.host_banks import HostResidency
+                requested_residency = [
+                    HostResidency.LOCKED.value if i in cpu_layer_ids
+                    else HostResidency.PINNED.value
+                    for i in range(num_moe_layers)
+                ]
         banks = load_expert_banks(
             self.dir, self.layout, dtype=self.dtype,
             layer_residency=requested_residency)

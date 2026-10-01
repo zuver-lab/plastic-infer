@@ -291,7 +291,7 @@ class OffloadMoeCache:
         -- the cache machinery is layout-agnostic and just moves rows.
 
         ``layer_residency`` labels each layer with a ``HostResidency`` value (default: all pinned).
-        Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must already be routed to the CPU executor (``cpu_layer_ids``, set BEFORE this call), the copy plan skips their rows, and their only movement is ``copy_missing``'s whole-layer pageable prefill branch -- which is why prefill overlap is incompatible with them.
+        Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must already be routed to the CPU executor (``cpu_layer_ids``, set BEFORE this call) -- or, under ``decode_target == "hybrid"``, be served by ``copy_missing``'s pageable fetch, which gathers this step's staged rows through a small pinned staging region instead of a device-side read of the bank. The copy plan skips their rows, and their only whole-layer movement is the pageable prefill materialize -- which is why prefill overlap is incompatible with them.
         """
         from .host_banks import HostResidency
 
@@ -305,11 +305,16 @@ class OffloadMoeCache:
             i for i, r in enumerate(residency) if r != HostResidency.PINNED.value
         )
         if unpinned:
-            if not unpinned <= self.cpu_layer_ids:
+            # a layer without a device address decodes on the CPU executor (offload)
+            # or, under hybrid, via copy_missing's pageable fetch; anything else has
+            # no way to move its rows.
+            if self.decode_target != "hybrid" and not unpinned <= self.cpu_layer_ids:
                 raise ValueError(
                     f"non-pinned layers {sorted(unpinned - self.cpu_layer_ids)} are not in "
-                    f"cpu_layer_ids: a layer without a device address can only decode on "
-                    f"the CPU executor (set cache.cpu_layer_ids before set_bank_sources)"
+                    f"cpu_layer_ids and the cache is not hybrid: a layer without a device "
+                    f"address can only decode on the CPU executor (offload) or through "
+                    f"copy_missing's pageable fetch (hybrid); set cache.cpu_layer_ids "
+                    f"before set_bank_sources"
                 )
             if self.prefill_overlap:
                 raise ValueError(
@@ -970,16 +975,25 @@ class OffloadMoeCache:
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
         if layer_id in self._unpinned_layers:
-            if not self._pending_whole_layer:
-                raise RuntimeError(
-                    f"layer {layer_id} is unpinned: its only copy is the whole-layer "
-                    f"pageable materialize (position == expert id); ensure_experts's "
-                    f"LRU slot remap cannot be honored without a device alias"
-                )
-            # the only copy a non-pinned layer ever needs is the non-overlap prefill materialize, which schedules the whole layer into slots [0, num_experts) with position == expert id -- a plain synchronous pageable H2D copy
-            # never CUDA-graph captured: prefill is not captured, and decode never reaches this branch (it routes to the CPU executor)
-            for per_layer, cache in self.banks:
-                cache[: self.num_experts].copy_(per_layer[layer_id])
+            if self._pending_whole_layer:
+                # the only whole-layer copy a non-pinned layer needs is the non-overlap prefill materialize, which schedules the whole layer into slots [0, num_experts) with position == expert id -- a plain synchronous pageable H2D copy
+                # never CUDA-graph captured: prefill is not captured
+                for per_layer, cache in self.banks:
+                    cache[: self.num_experts].copy_(per_layer[layer_id])
+                return
+            # pageable hybrid fetch (decode): the bank has no device alias, so the
+            # staged missing rows (src_indices = layer-local expert rows, evict_slots
+            # = GPU slot ids, num_indices = capped fetch count) are gathered on the
+            # host and moved H2D. torch stages the pageable copy internally, so the
+            # pinned footprint is this step's fetch, not the whole bank -- that is
+            # what lets hybrid run under a capped WSL pin budget.
+            n = int(self.num_indices.item())
+            if n:
+                src_idx = self.src_indices[:n].cpu()
+                evict = self.evict_slots[:n].long()  # index_copy_ wants int64
+                for per_layer, cache in self.banks:
+                    rows = per_layer[layer_id].index_select(0, src_idx).to(self.device)
+                    cache.index_copy_(0, evict, rows)
             return
         if self._copy_fused_ok:
             from ..kernel.fast_index_copy import fast_index_copy_multi_jit

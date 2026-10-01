@@ -127,8 +127,11 @@ class TestEngineEquivalence:
         """Shrinking the WSL pin budget below the tiny banks auto-locks every
         MoE layer to CPU decode (_auto_cpu_layers -> _init_cpu_moe_executor):
         the _cpu_moe executor is built and greedy decode still matches HF
-        token-for-token."""
+        token-for-token. FREETOKEN_MOE_BACKEND=offload keeps decode_target on
+        FreeToken's offload path ("cpu" when layers are CPU-locked); hybrid
+        resolution under that pin cap is covered by test_hybrid_default."""
         monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", "0.000001")
+        monkeypatch.setenv("FREETOKEN_MOE_BACKEND", "offload")
         eng = Engine(model_dir[0], _profile(), device=require_cuda())
         torch.manual_seed(32)
         prompt = torch.randint(0, eng.config.vocab_size, (8,)).tolist()
@@ -144,6 +147,35 @@ class TestEngineEquivalence:
                 max_new_tokens=n_gen, do_sample=False, use_cache=True)
         assert result.tokens[len(prompt):] == hf_ids[0, len(prompt):].tolist(), (
             f"cpu-locked decode {result.tokens[len(prompt):]} != HF "
+            f"{hf_ids[0, len(prompt):].tolist()}")
+
+    def test_hybrid_default(self, model_dir, hf_model, monkeypatch) -> None:
+        """Hybrid is the default backend: decode_target=="hybrid", the
+        bandwidth-matched fetch fraction is wired (hybrid_fetch_fraction = the
+        probed pcie/cpu ratio; hybrid_max_fetch = num_experts, the inert cap so
+        the fraction governs), and greedy decode still matches HF with the CPU
+        executor carrying this step's overflow misses."""
+        import plastic_infer.moe.bandwidth as bw
+        monkeypatch.setattr(
+            bw, "probe",
+            lambda *a, **k: {"recommended": "hybrid", "fraction": 0.4,
+                             "cpu_bw": 50.0, "pcie_bw": 20.0, "fused": True})
+        eng = Engine(model_dir[0], _profile(), device=require_cuda())
+        torch.manual_seed(33)
+        prompt = torch.randint(0, eng.config.vocab_size, (8,)).tolist()
+        n_gen = 4
+        result = eng.run(prompt, max_new_tokens=n_gen)  # builds the MoE cache
+        assert eng.cpu_moe_executor is not None
+        assert eng._moe_cache is not None
+        assert eng._moe_cache.decode_target == "hybrid"
+        assert eng._moe_cache.hybrid_fetch_fraction == 0.4
+        assert eng._moe_cache.hybrid_max_fetch == eng.config.n_experts
+        with torch.no_grad():
+            hf_ids = hf_model.generate(
+                torch.tensor([prompt], device=hf_model.device),
+                max_new_tokens=n_gen, do_sample=False, use_cache=True)
+        assert result.tokens[len(prompt):] == hf_ids[0, len(prompt):].tolist(), (
+            f"hybrid decode {result.tokens[len(prompt):]} != HF "
             f"{hf_ids[0, len(prompt):].tolist()}")
 
     def test_stream_timing_and_run_equivalence(self, engine: Engine) -> None:

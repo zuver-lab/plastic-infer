@@ -269,7 +269,32 @@ class Engine:
                              self.layout.num_experts(l)
                              for l in range(num_moe_layers))
             cpu_layer_ids = _auto_cpu_layers(num_moe_layers, bank_bytes)
-        decode_target = "cpu" if cpu_layer_ids else "gpu"
+        # backend (FreeToken --moe-backend, default hybrid): the CPU executor
+        # computes each step's overflow misses while the GPU computes the cache
+        # hits + the bandwidth-matched fetched share. FREETOKEN_MOE_BACKEND=offload
+        # restores plain GPU offload; =auto applies FreeToken's hardware gate
+        # (offload -> hybrid only when the CPU MoE bw clears the PCIe gather bw
+        # by the bench threshold). CPU-locked layers still override at decode
+        # (is_cpu_layer wins), exactly like FreeToken.
+        backend = os.environ.get("FREETOKEN_MOE_BACKEND", "hybrid").strip().lower()
+        if backend == "hybrid":
+            decode_target = "hybrid"
+        elif backend == "auto":
+            from ..moe.bandwidth import probe
+            p = probe(self.device, self.config.n_experts, self.config.hidden_dim,
+                      self.config.intermediate_dim, self.config.n_experts_per_tok)
+            decode_target = ("hybrid" if (p and p["recommended"] == "hybrid")
+                             else "cpu" if cpu_layer_ids else "gpu")
+        else:  # "offload" (or anything unknown)
+            decode_target = "cpu" if cpu_layer_ids else "gpu"
+        # a default hybrid boot degrades to GPU offload when the CPU executor cannot
+        # serve this model (an explicit FREETOKEN_MOE_BACKEND=hybrid fails loudly in
+        # the executor build instead).
+        if decode_target == "hybrid" and not _cpu_moe_executor_viable():
+            logger.info(
+                "moe backend hybrid defaulted but the CPU MoE executor cannot serve "
+                "this model; using plain GPU offload")
+            decode_target = "gpu"
         # split residency: where pinning is quota-capped (_pin_budget_bytes), pin
         # only the GPU layers' banks and mlock the CPU layers'.
         split_residency = bool(cpu_layer_ids) and _pin_budget_bytes() is not None
@@ -309,6 +334,8 @@ class Engine:
                                layer_residency=banks.layer_residency)
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         cache.collect_stats = True
+        if decode_target == "hybrid":
+            self._resolve_hybrid_fetch(cache)
         if decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(cache)
         logger.info(
@@ -318,6 +345,27 @@ class Engine:
             cache.cache_size * per_expert / 2**30,
             "split" if split_residency else "pinned")
         return cache
+
+    def _resolve_hybrid_fetch(self, cache) -> None:
+        """FreeToken ``_resolve_hybrid_fetch``: cap each hybrid step's fetch by the
+        bandwidth-matched fraction (pcie_bw / cpu_bw) so the PCIe pull and the CPU
+        overflow GEMV finish together; the fixed cap of 1 applies only when no
+        usable measurement exists. Sets ``hybrid_max_fetch`` to the slot count,
+        which makes the fraction the operative cap (exactly FreeToken)."""
+        from ..moe.bandwidth import probe
+        p = probe(self.device, self.config.n_experts, self.config.hidden_dim,
+                  self.config.intermediate_dim, self.config.n_experts_per_tok)
+        if p is None or p["fraction"] is None:
+            logger.warning(
+                "hybrid fetch: no usable bandwidth measurement; capping each "
+                "step's PCIe fetch at 1 miss (cache.hybrid_max_fetch)")
+            return  # cache.hybrid_max_fetch stays its default of 1
+        cache.hybrid_max_fetch = cache.num_experts  # inert: fraction is the cap
+        cache.hybrid_fetch_fraction = p["fraction"]
+        logger.info(
+            "hybrid fetch: PCIe pulls %.0f%% of each step's misses (pcie %.2f "
+            "GB/s vs cpu %.2f GB/s, fused=%s); the rest run on the CPU",
+            p["fraction"] * 100, p["pcie_bw"], p["cpu_bw"], p["fused"])
 
     def _init_cpu_moe_executor(self, cache) -> None:
         """Build the persistent CPU MoE executor (decode-time expert compute).

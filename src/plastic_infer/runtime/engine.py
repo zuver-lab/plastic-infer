@@ -263,7 +263,10 @@ class Engine:
         num_moe_layers = self.config.n_layers
         cpu_layer_ids = _resolve_cpu_layers()
         if not cpu_layer_ids and _pin_budget_bytes() is not None:
-            bank_bytes = sum(self.layout.expert_total_bytes(l)
+            # FreeToken sizes this as layers * experts * per-expert
+            # (bank_bytes_estimate); expert_total_bytes is one expert's rows.
+            bank_bytes = sum(self.layout.expert_total_bytes(l) *
+                             self.layout.num_experts(l)
                              for l in range(num_moe_layers))
             cpu_layer_ids = _auto_cpu_layers(num_moe_layers, bank_bytes)
         decode_target = "cpu" if cpu_layer_ids else "gpu"

@@ -16,7 +16,6 @@ from __future__ import annotations
 import torch
 
 from ..kv.kv_store import KVRequestCache, KVStore
-from ..store.experts import ExpertSlotPool
 from .attention import build_rope_cache, qk_norm, rms_norm, rope_positions
 from .moe import moe_forward_sparse, topk_route
 from .runner import DenseWeights, ModelConfig, linear
@@ -32,7 +31,7 @@ from .runner_paged import (
 def prefill_forward_moe_paged(
     weights: DenseWeights,
     config: ModelConfig,
-    pool: ExpertSlotPool,
+    moe_cache,
     store: KVStore,
     cache: KVRequestCache,
     input_ids: torch.Tensor,   # [seq_len]
@@ -91,7 +90,7 @@ def prefill_forward_moe_paged(
         residual = x
         x = rms_norm(x,
                      weights[f"layers.{layer_idx}.post_attention_layernorm.weight"])
-        x = _moe_ffn(x, weights, pool, layer_idx, config)
+        x = _moe_ffn(x, weights, moe_cache, layer_idx, config, is_decode=False)
         x = residual + x
 
     x = rms_norm(x, weights["norm.weight"])
@@ -102,7 +101,7 @@ def prefill_forward_moe_paged(
 def decode_step_moe_paged(
     weights: DenseWeights,
     config: ModelConfig,
-    pool: ExpertSlotPool,
+    moe_cache,
     store: KVStore,
     cache: KVRequestCache,
     input_id: int,
@@ -155,7 +154,7 @@ def decode_step_moe_paged(
         residual = x
         x = rms_norm(x,
                      weights[f"layers.{layer_idx}.post_attention_layernorm.weight"])
-        x = _moe_ffn(x, weights, pool, layer_idx, config)
+        x = _moe_ffn(x, weights, moe_cache, layer_idx, config, is_decode=True)
         x = residual + x
 
     x = rms_norm(x, weights["norm.weight"])

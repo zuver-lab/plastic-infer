@@ -2,7 +2,8 @@
 
 End-to-end through the runtime layer (runtime/engine.py): a converted
 tiny Qwen3Moe directory (dense HOST-resident, experts host LRU over
-disk, paged KV) is planned and run on CPU. The engine exposes tokens +
+disk, paged KV) is planned and run on CUDA (the FreeToken-ported engine
+is CUDA+bf16 only, like FreeToken itself). The engine exposes tokens +
 metrics, not intermediate logits, so equivalence is asserted on the
 greedy decode stream: if prefill logits and every decode step matched
 HF, the emitted tokens equal HF greedy generation token-for-token.
@@ -28,6 +29,7 @@ from test_qwen3moe_equiv import (
     tiny_qwen3moe_config,
     tiny_qwen3moe_config_dict,
 )
+from _moe_cache_helpers import require_cuda
 
 
 def _profile() -> DeviceProfile:
@@ -51,20 +53,25 @@ def model_dir(tmp_path_factory) -> tuple:
     model.eval()
     out = tmp_path_factory.mktemp("model") / "converted"
     convert_from_dict(model.state_dict(), tiny_qwen3moe_config_dict(),
-                      out, dtype=torch.float32)
-    (out / "config.json").write_text(
-        json.dumps(tiny_qwen3moe_config_dict()))
+                      out, dtype=torch.bfloat16)
+    cfg = dict(tiny_qwen3moe_config_dict())
+    cfg["torch_dtype"] = "bfloat16"
+    (out / "config.json").write_text(json.dumps(cfg))
     return out, model
 
 
 @pytest.fixture(scope="module")
 def hf_model(model_dir) -> Qwen3MoeForCausalLM:
-    return model_dir[1]
+    dev = require_cuda()
+    model = model_dir[1]
+    model.to(device=dev, dtype=torch.bfloat16)
+    model.eval()
+    return model
 
 
 @pytest.fixture(scope="module")
 def engine(model_dir) -> Engine:
-    return Engine(model_dir[0], _profile(), device=torch.device("cpu"))
+    return Engine(model_dir[0], _profile(), device=require_cuda())
 
 
 class TestEnginePlan:
@@ -101,8 +108,8 @@ class TestEngineEquivalence:
 
         with torch.no_grad():
             hf_ids = hf_model.generate(
-                torch.tensor([prompt]), max_new_tokens=n_gen,
-                do_sample=False, use_cache=True,
+                torch.tensor([prompt], device=hf_model.device),
+                max_new_tokens=n_gen, do_sample=False, use_cache=True,
             )
         hf_gen = hf_ids[0, len(prompt):].tolist()
 
@@ -114,6 +121,34 @@ class TestEngineEquivalence:
         a = engine.run(prompt, max_new_tokens=5).tokens
         b = engine.run(prompt, max_new_tokens=5).tokens
         assert a == b
+
+    def test_stream_timing_and_run_equivalence(self, engine: Engine) -> None:
+        """stream() yields one (token, elapsed) per generated token with
+        non-decreasing elapsed, and run() (which drains it) gives the
+        same tokens. TTFT is the first pair's elapsed."""
+        prompt = [4, 8, 15]
+        n_gen = 4
+        it = engine.stream(prompt, max_new_tokens=n_gen)
+        elapsed: list[float] = []
+        gen: list[int] = []
+        try:
+            while True:
+                tok, t = next(it)
+                gen.append(tok)
+                elapsed.append(t)
+        except StopIteration as e:
+            result = e.value
+
+        assert len(gen) == n_gen
+        assert elapsed == sorted(elapsed)      # monotonic cumulative time
+        assert elapsed[0] > 0                  # TTFT
+        assert 0 < result.metrics["ttft_seconds"] <= elapsed[-1]
+        assert result.metrics["e2e_seconds"] >= elapsed[-1]
+        assert result.tokens == prompt + gen
+
+        run_result = engine.run(prompt, max_new_tokens=n_gen)
+        assert run_result.tokens == result.tokens
+        assert run_result.metrics["ttft_seconds"] > 0
 
     def test_rejects_oversized_request(self, engine: Engine) -> None:
         """Requests beyond the GPU KV pool are rejected clearly

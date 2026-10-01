@@ -3,8 +3,10 @@
 Gates:
   1. Paged MoE prefill/decode == flat MoE runner and HF Mixtral.
   2. Prefix-loaded cache + incremental prefill == full prefill (D10),
-     with experts served by the slot pool.
+     with experts served by the FreeToken offload cache.
   3. Tight slot budget still identical (D5); hit-rate observable.
+
+CUDA + bf16 (the FreeToken port is CUDA-only).
 """
 
 from __future__ import annotations
@@ -21,8 +23,9 @@ from plastic_infer.exec.runner_moe_paged import (
 )
 from plastic_infer.exec.runner_paged import make_kv_config
 from plastic_infer.kv.kv_store import KVConfig, KVStore
-from plastic_infer.store.experts import ExpertBank, ExpertSlotPool
+from plastic_infer.store.experts import ExpertBank
 
+from _moe_cache_helpers import make_moe_cache, require_cuda
 from test_equiv_smoke_moe import (  # noqa: F401
     _extract_moe_weights,
     _make_moe_config,
@@ -32,8 +35,10 @@ from test_equiv_smoke_moe import (  # noqa: F401
 
 @pytest.fixture(scope="module")
 def hf_model() -> MixtralForCausalLM:
+    dev = require_cuda()
     torch.manual_seed(42)
     model = MixtralForCausalLM(_tiny_mixtral_config())
+    model.to(device=dev, dtype=torch.bfloat16)
     model.eval()
     return model
 
@@ -45,8 +50,10 @@ def config(hf_model: MixtralForCausalLM) -> ModelConfig:
 
 @pytest.fixture(scope="module")
 def weights(hf_model: MixtralForCausalLM) -> DenseWeights:
+    dev = require_cuda()
     dense, _bank = _extract_moe_weights(hf_model)
-    return DenseWeights(dense)
+    return DenseWeights({k: v.to(device=dev, dtype=torch.bfloat16)
+                         for k, v in dense.items()})
 
 
 @pytest.fixture(scope="module")
@@ -55,16 +62,17 @@ def bank(hf_model: MixtralForCausalLM) -> ExpertBank:
     return bank
 
 
-def _pool(bank: ExpertBank, n_slots: int) -> ExpertSlotPool:
-    one_expert = bank.bytes(next(iter(bank.keys())))
-    return ExpertSlotPool(bank, budget_bytes=n_slots * one_expert)
-
-
 def _assert_allclose(a: torch.Tensor, b: torch.Tensor, where: str) -> None:
     assert a.shape == b.shape
-    assert torch.allclose(a, b, atol=1e-2), (
-        f"{where}: max diff = {(a - b).abs().max().item():.6f}"
+    assert torch.allclose(a.float(), b.float(), atol=0.05, rtol=0.05), (
+        f"{where}: max diff = {(a - b).float().abs().max().item():.6f}"
     )
+
+
+def _kv(config: ModelConfig, weights: DenseWeights) -> tuple[KVStore, KVStore]:
+    store = KVStore(make_kv_config(config, max_pages=512,
+                                   device=weights.device))
+    return store, store.new_request()
 
 
 # ---------------------------------------------------------------------------
@@ -76,19 +84,20 @@ class TestPagedMoEEquivalence:
         self, weights: DenseWeights, config: ModelConfig, bank: ExpertBank,
     ) -> None:
         torch.manual_seed(0)
-        input_ids = torch.randint(0, config.vocab_size, (16,))
+        input_ids = torch.randint(0, config.vocab_size, (16,),
+                                  device=weights.device)
 
-        flat_pool = _pool(bank, n_slots=16)
-        flat_kv = DenseKVCache(config, max_seq_len=128, dtype=torch.float32)
+        flat_cache = make_moe_cache(bank, n_slots=16)
+        flat_kv = DenseKVCache(config, max_seq_len=128, dtype=torch.bfloat16,
+                               device=weights.device)
         flat_logits = prefill_forward_moe(
-            weights, config, flat_pool, flat_kv, input_ids,
+            weights, config, flat_cache, flat_kv, input_ids,
         )
 
-        store = KVStore(make_kv_config(config, max_pages=512))
-        paged_pool = _pool(bank, n_slots=16)
-        cache = store.new_request()
+        store, cache = _kv(config, weights)
+        paged_cache = make_moe_cache(bank, n_slots=16)
         paged_logits = prefill_forward_moe_paged(
-            weights, config, paged_pool, store, cache, input_ids,
+            weights, config, paged_cache, store, cache, input_ids,
         )
 
         _assert_allclose(paged_logits, flat_logits, "paged vs flat prefill")
@@ -98,13 +107,13 @@ class TestPagedMoEEquivalence:
         hf_model: MixtralForCausalLM,
     ) -> None:
         torch.manual_seed(1)
-        input_ids = torch.randint(0, config.vocab_size, (12,))
+        input_ids = torch.randint(0, config.vocab_size, (12,),
+                                  device=weights.device)
 
-        store = KVStore(make_kv_config(config, max_pages=512))
-        pool = _pool(bank, n_slots=16)
-        cache = store.new_request()
+        store, cache = _kv(config, weights)
+        moe_cache = make_moe_cache(bank, n_slots=16)
         our_logits = prefill_forward_moe_paged(
-            weights, config, pool, store, cache, input_ids,
+            weights, config, moe_cache, store, cache, input_ids,
         )
 
         with torch.no_grad():
@@ -118,20 +127,20 @@ class TestPagedMoEEquivalence:
     ) -> None:
         torch.manual_seed(2)
         prompt_len, n_decode = 6, 4
-        input_ids = torch.randint(0, config.vocab_size, (prompt_len,))
+        input_ids = torch.randint(0, config.vocab_size, (prompt_len,),
+                                  device=weights.device)
 
-        store = KVStore(make_kv_config(config, max_pages=512))
-        pool = _pool(bank, n_slots=16)
-        cache = store.new_request()
+        store, cache = _kv(config, weights)
+        moe_cache = make_moe_cache(bank, n_slots=16)
         our_prefill = prefill_forward_moe_paged(
-            weights, config, pool, store, cache, input_ids,
+            weights, config, moe_cache, store, cache, input_ids,
         )
         our_tokens: list[int] = [int(our_prefill.argmax().item())]
         our_logits: list[torch.Tensor] = [our_prefill]
 
         for _ in range(n_decode):
             logits = decode_step_moe_paged(
-                weights, config, pool, store, cache, our_tokens[-1],
+                weights, config, moe_cache, store, cache, our_tokens[-1],
             )
             our_logits.append(logits)
             our_tokens.append(int(logits.argmax().item()))
@@ -139,7 +148,7 @@ class TestPagedMoEEquivalence:
         with torch.no_grad():
             full_ids = torch.tensor(
                 input_ids.tolist() + our_tokens[:n_decode],
-            ).unsqueeze(0)
+            ).unsqueeze(0).to(weights.device)
             hf_logits_all = hf_model(full_ids).logits[0]
 
         for step in range(n_decode + 1):
@@ -151,23 +160,24 @@ class TestPagedMoEEquivalence:
         self, weights: DenseWeights, config: ModelConfig, bank: ExpertBank,
         hf_model: MixtralForCausalLM,
     ) -> None:
-        """D5: 2 expert slots + paged KV — constant eviction, same logits."""
+        """D5: the tightest cache budget (== num_experts) + paged KV —
+        constant eviction, same logits."""
         torch.manual_seed(3)
         prompt_len, n_decode = 3, 3
-        input_ids = torch.randint(0, config.vocab_size, (prompt_len,))
+        input_ids = torch.randint(0, config.vocab_size, (prompt_len,),
+                                  device=weights.device)
 
-        store = KVStore(make_kv_config(config, max_pages=512))
-        pool = _pool(bank, n_slots=2)
-        cache = store.new_request()
+        store, cache = _kv(config, weights)
+        moe_cache = make_moe_cache(bank, n_slots=8)
         our_prefill = prefill_forward_moe_paged(
-            weights, config, pool, store, cache, input_ids,
+            weights, config, moe_cache, store, cache, input_ids,
         )
         our_tokens: list[int] = [int(our_prefill.argmax().item())]
         our_logits: list[torch.Tensor] = [our_prefill]
 
         for _ in range(n_decode):
             logits = decode_step_moe_paged(
-                weights, config, pool, store, cache, our_tokens[-1],
+                weights, config, moe_cache, store, cache, our_tokens[-1],
             )
             our_logits.append(logits)
             our_tokens.append(int(logits.argmax().item()))
@@ -175,7 +185,7 @@ class TestPagedMoEEquivalence:
         with torch.no_grad():
             full_ids = torch.tensor(
                 input_ids.tolist() + our_tokens[:n_decode],
-            ).unsqueeze(0)
+            ).unsqueeze(0).to(weights.device)
             hf_logits_all = hf_model(full_ids).logits[0]
 
         for step in range(n_decode + 1):
@@ -183,15 +193,26 @@ class TestPagedMoEEquivalence:
             _assert_allclose(our_logits[step], hf_logits_all[pos],
                              f"tight paged decode step {step}")
 
-        assert 0.0 <= pool.hit_rate <= 1.0
-        assert pool.pool.used_bytes <= pool.pool.budget_bytes
+        # hit-rate observable (M1 gate): the tight budget churned every step
+        mstats = moe_cache.decode_miss_stats()
+        assert mstats["layer_calls"] > 0
+        assert mstats["miss_rate"] > 0.0
+        assert 0.0 <= 1.0 - mstats["miss_rate"] <= 1.0
 
 
 # ---------------------------------------------------------------------------
-# Prefix reuse (D10) with experts served by the slot pool
+# Prefix reuse (D10) with experts served by the offload cache
 # ---------------------------------------------------------------------------
 
 class TestPagedMoEPrefixReuse:
+    def _small_store(self, weights: DenseWeights) -> KVStore:
+        return KVStore(KVConfig(
+            n_layers=2, n_kv_heads=2, head_dim=16,
+            page_size=4, pages_per_chunk=2,   # 8 tokens per chunk
+            max_pages=512, max_host_chunks=32,
+            dtype=torch.bfloat16, device=weights.device,
+        ))
+
     def test_prefix_load_plus_tail_equals_full(
         self, weights: DenseWeights, config: ModelConfig, bank: ExpertBank,
     ) -> None:
@@ -199,23 +220,18 @@ class TestPagedMoEPrefixReuse:
         and only computing the 5-token tail yields the same final logits
         as a full prefill from scratch."""
         torch.manual_seed(10)
-        small_cfg = KVConfig(
-            n_layers=config.n_layers,
-            n_kv_heads=config.n_kv_heads,
-            head_dim=config.head_dim,
-            page_size=4, pages_per_chunk=2,   # 8 tokens per chunk
-            max_pages=512, max_host_chunks=32,
-            dtype=torch.float32, device=torch.device("cpu"),
-        )
         prefix_len, tail_len = 24, 5
-        all_tokens = torch.randint(0, config.vocab_size, (prefix_len + tail_len,))
+        all_tokens = torch.randint(0, config.vocab_size,
+                                   (prefix_len + tail_len,),
+                                   device=weights.device)
         prefix, tail = all_tokens[:prefix_len], all_tokens[prefix_len:]
+        moe_cache = make_moe_cache(bank, n_slots=8)
 
         # One store holds the host L1 cache across requests.
-        store = KVStore(small_cfg)
+        store = self._small_store(weights)
         c1 = store.new_request()
         prefill_forward_moe_paged(
-            weights, config, _pool(bank, n_slots=8), store, c1, prefix,
+            weights, config, moe_cache, store, c1, prefix,
         )
         c1.set_token_ids(prefix.tolist())
         assert store.sink_completed_chunks(c1) == 3
@@ -227,16 +243,16 @@ class TestPagedMoEPrefixReuse:
         assert matched == prefix_len
         assert len(keys) == 3
         tail_logits = prefill_forward_moe_paged(
-            weights, config, _pool(bank, n_slots=8), store, c2, tail,
+            weights, config, moe_cache, store, c2, tail,
             start_pos=prefix_len,
         )
 
         # Reference: full prefill from scratch
-        store_ref = KVStore(small_cfg)
+        store_ref = self._small_store(weights)
         c_ref = store_ref.new_request()
         ref_logits = prefill_forward_moe_paged(
-            weights, config, _pool(bank, n_slots=8), store_ref, c_ref,
-            all_tokens,
+            weights, config, make_moe_cache(bank, n_slots=8),
+            store_ref, c_ref, all_tokens,
         )
 
         _assert_allclose(tail_logits, ref_logits, "prefix reuse tail")
@@ -244,23 +260,19 @@ class TestPagedMoEPrefixReuse:
     def test_prefix_load_tight_slots_equals_full(
         self, weights: DenseWeights, config: ModelConfig, bank: ExpertBank,
     ) -> None:
-        """D10 + D5: prefix reuse under a 2-expert slot budget."""
+        """D10 + D5: prefix reuse under the tightest cache budget."""
         torch.manual_seed(11)
-        small_cfg = KVConfig(
-            n_layers=config.n_layers, n_kv_heads=config.n_kv_heads,
-            head_dim=config.head_dim,
-            page_size=4, pages_per_chunk=2,
-            max_pages=512, max_host_chunks=32,
-            dtype=torch.float32, device=torch.device("cpu"),
-        )
         prefix_len, tail_len = 16, 4
-        all_tokens = torch.randint(0, config.vocab_size, (prefix_len + tail_len,))
+        all_tokens = torch.randint(0, config.vocab_size,
+                                   (prefix_len + tail_len,),
+                                   device=weights.device)
         prefix, tail = all_tokens[:prefix_len], all_tokens[prefix_len:]
+        moe_cache = make_moe_cache(bank, n_slots=8)
 
-        store = KVStore(small_cfg)
+        store = self._small_store(weights)
         c1 = store.new_request()
         prefill_forward_moe_paged(
-            weights, config, _pool(bank, n_slots=2), store, c1, prefix,
+            weights, config, moe_cache, store, c1, prefix,
         )
         c1.set_token_ids(prefix.tolist())
         store.sink_completed_chunks(c1)
@@ -270,15 +282,15 @@ class TestPagedMoEPrefixReuse:
         matched, _ = store.load_prefix(c2, all_tokens.tolist())
         assert matched == prefix_len
         tail_logits = prefill_forward_moe_paged(
-            weights, config, _pool(bank, n_slots=2), store, c2, tail,
+            weights, config, moe_cache, store, c2, tail,
             start_pos=prefix_len,
         )
 
-        store_ref = KVStore(small_cfg)
+        store_ref = self._small_store(weights)
         c_ref = store_ref.new_request()
         ref_logits = prefill_forward_moe_paged(
-            weights, config, _pool(bank, n_slots=2), store_ref, c_ref,
-            all_tokens,
+            weights, config, make_moe_cache(bank, n_slots=8),
+            store_ref, c_ref, all_tokens,
         )
 
         _assert_allclose(tail_logits, ref_logits, "tight prefix reuse tail")
@@ -288,20 +300,14 @@ class TestPagedMoEPrefixReuse:
     ) -> None:
         """Only matching chunks are loaded; the rest is computed (D10)."""
         torch.manual_seed(12)
-        small_cfg = KVConfig(
-            n_layers=config.n_layers, n_kv_heads=config.n_kv_heads,
-            head_dim=config.head_dim,
-            page_size=4, pages_per_chunk=2,
-            max_pages=512, max_host_chunks=32,
-            dtype=torch.float32, device=torch.device("cpu"),
-        )
-        chunk_tokens = small_cfg.tokens_per_chunk  # 8
+        store = self._small_store(weights)
+        chunk_tokens = store.config.tokens_per_chunk  # 8
 
-        req1 = torch.randint(0, config.vocab_size, (chunk_tokens * 2,))
-        store = KVStore(small_cfg)
+        req1 = torch.randint(0, config.vocab_size, (chunk_tokens * 2,),
+                             device=weights.device)
         c1 = store.new_request()
         prefill_forward_moe_paged(
-            weights, config, _pool(bank, n_slots=8), store, c1, req1,
+            weights, config, make_moe_cache(bank, n_slots=8), store, c1, req1,
         )
         c1.set_token_ids(req1.tolist())
         store.sink_completed_chunks(c1)
@@ -310,8 +316,10 @@ class TestPagedMoEPrefixReuse:
         # Same first chunk, different second chunk + extra tokens
         req2 = req1.clone()
         req2[chunk_tokens:] = torch.randint(0, config.vocab_size,
-                                            (chunk_tokens,))
-        req2 = torch.cat([req2, torch.randint(0, config.vocab_size, (4,))])
+                                            (chunk_tokens,),
+                                            device=weights.device)
+        req2 = torch.cat([req2, torch.randint(0, config.vocab_size, (4,),
+                                              device=weights.device)])
 
         c2 = store.new_request()
         matched, keys = store.load_prefix(c2, req2.tolist())

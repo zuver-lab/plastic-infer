@@ -4,15 +4,15 @@ M1 gate from DESIGN.md §7:
   - test_ops / test_equiv_smoke(MoE) green
   - decode expert hit-rate observable
 
-The sparse expert path (routed subset through a budget-bounded LRU
-slot pool) must produce the *same* logits as HF — with any slot
-budget, even one that forces constant eviction (D5: numerics
-independent of placement).
+The FreeToken offload path (routed experts through the OffloadMoeCache
+slot cache / whole-layer prefill movement) must produce the *same*
+logits as HF — with any slot budget, even one that forces constant
+eviction (D5: numerics independent of placement). CUDA + bf16 only.
 
 Uses transformers 5.14's Mixtral (no shared expert; experts stored as
 fused gate_up_proj / down_proj). The router there softmaxes over all
 experts, top-k-picks probabilities, then renormalizes — which equals
-softmax over the top-k logits, exactly what topk_route does.
+softmax over the top-k logits, exactly what fused_topk does.
 """
 
 from __future__ import annotations
@@ -23,7 +23,9 @@ from transformers import MixtralConfig, MixtralForCausalLM
 
 from plastic_infer.exec.runner import DenseKVCache, DenseWeights, ModelConfig
 from plastic_infer.exec.runner_moe import decode_step_moe, prefill_forward_moe
-from plastic_infer.store.experts import ExpertBank, ExpertSlotPool, ExpertWeights
+from plastic_infer.store.experts import ExpertBank, ExpertWeights
+
+from _moe_cache_helpers import make_moe_cache, require_cuda
 
 
 # ---------------------------------------------------------------------------
@@ -103,20 +105,22 @@ def _make_moe_config(hf_cfg: MixtralConfig) -> ModelConfig:
         vocab_size=hf_cfg.vocab_size,
         max_seq_len=hf_cfg.max_position_embeddings,
         rope_base=_rope_theta(hf_cfg),
-        dtype=torch.float32,
+        dtype=torch.bfloat16,
         n_experts=hf_cfg.num_local_experts,
         n_experts_per_tok=hf_cfg.num_experts_per_tok,
     )
 
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# Fixtures (CUDA + bf16)
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
 def hf_model() -> MixtralForCausalLM:
+    dev = require_cuda()
     torch.manual_seed(42)
     model = MixtralForCausalLM(_tiny_mixtral_config())
+    model.to(device=dev, dtype=torch.bfloat16)
     model.eval()
     return model
 
@@ -128,8 +132,10 @@ def config(hf_model: MixtralForCausalLM) -> ModelConfig:
 
 @pytest.fixture(scope="module")
 def weights(hf_model: MixtralForCausalLM) -> DenseWeights:
+    dev = require_cuda()
     dense, _bank = _extract_moe_weights(hf_model)
-    return DenseWeights(dense)
+    return DenseWeights({k: v.to(device=dev, dtype=torch.bfloat16)
+                         for k, v in dense.items()})
 
 
 @pytest.fixture(scope="module")
@@ -138,16 +144,16 @@ def bank(hf_model: MixtralForCausalLM) -> ExpertBank:
     return bank
 
 
-def _pool(bank: ExpertBank, n_slots: int) -> ExpertSlotPool:
-    one_expert = bank.bytes(next(iter(bank.keys())))
-    return ExpertSlotPool(bank, budget_bytes=n_slots * one_expert)
-
-
 def _assert_allclose(a: torch.Tensor, b: torch.Tensor, where: str) -> None:
     assert a.shape == b.shape
-    assert torch.allclose(a, b, atol=1e-2), (
-        f"{where}: max diff = {(a - b).abs().max().item():.6f}"
+    assert torch.allclose(a.float(), b.float(), atol=0.05, rtol=0.05), (
+        f"{where}: max diff = {(a - b).float().abs().max().item():.6f}"
     )
+
+
+def _kv(config: ModelConfig) -> DenseKVCache:
+    return DenseKVCache(config, max_seq_len=128, dtype=torch.bfloat16,
+                        device=require_cuda())
 
 
 # ---------------------------------------------------------------------------
@@ -160,11 +166,13 @@ class TestMoEPrefillEquivalence:
         hf_model: MixtralForCausalLM,
     ) -> None:
         torch.manual_seed(0)
-        input_ids = torch.randint(0, config.vocab_size, (16,))
-        pool = _pool(bank, n_slots=16)   # everything fits
+        input_ids = torch.randint(0, config.vocab_size, (16,),
+                                  device=weights.device)
+        moe_cache = make_moe_cache(bank, n_slots=16)   # everything fits
 
-        kv = DenseKVCache(config, max_seq_len=128, dtype=torch.float32)
-        our_logits = prefill_forward_moe(weights, config, pool, kv, input_ids)
+        kv = _kv(config)
+        our_logits = prefill_forward_moe(weights, config, moe_cache, kv,
+                                         input_ids)
 
         with torch.no_grad():
             hf_logits = hf_model(input_ids.unsqueeze(0)).logits[0, -1]
@@ -176,16 +184,17 @@ class TestMoEPrefillEquivalence:
         hf_model: MixtralForCausalLM,
     ) -> None:
         torch.manual_seed(1)
-        input_ids = torch.randint(0, config.vocab_size, (8,))
-        pool = _pool(bank, n_slots=8)    # half the experts — forces churn
+        input_ids = torch.randint(0, config.vocab_size, (8,),
+                                  device=weights.device)
+        moe_cache = make_moe_cache(bank, n_slots=8)    # tight — forces churn
 
         with torch.no_grad():
             hf_logits_all = hf_model(input_ids.unsqueeze(0)).logits[0]
 
         for i in range(1, 9):
-            kv = DenseKVCache(config, max_seq_len=128, dtype=torch.float32)
+            kv = _kv(config)
             our_logits = prefill_forward_moe(
-                weights, config, pool, kv, input_ids[:i],
+                weights, config, moe_cache, kv, input_ids[:i],
             )
             _assert_allclose(our_logits, hf_logits_all[i - 1],
                              f"position {i - 1}")
@@ -194,21 +203,22 @@ class TestMoEPrefillEquivalence:
         self, weights: DenseWeights, config: ModelConfig, bank: ExpertBank,
         hf_model: MixtralForCausalLM,
     ) -> None:
-        """D5: with only 4 slots (2 layers * up-to-4 routed experts),
-        the pool must evict constantly yet produce identical logits."""
+        """D5: the tightest slot budget the cache allows (== num_experts)
+        must still produce identical logits; prefill streams whole layers,
+        so placement cannot enter at all."""
         torch.manual_seed(2)
-        input_ids = torch.randint(0, config.vocab_size, (2,))
-        pool = _pool(bank, n_slots=4)
+        input_ids = torch.randint(0, config.vocab_size, (2,),
+                                  device=weights.device)
+        moe_cache = make_moe_cache(bank, n_slots=8)
 
-        kv = DenseKVCache(config, max_seq_len=128, dtype=torch.float32)
-        our_logits = prefill_forward_moe(weights, config, pool, kv, input_ids)
+        kv = _kv(config)
+        our_logits = prefill_forward_moe(weights, config, moe_cache, kv,
+                                         input_ids)
 
         with torch.no_grad():
             hf_logits = hf_model(input_ids.unsqueeze(0)).logits[0, -1]
 
         _assert_allclose(our_logits, hf_logits, "tight-slot prefill")
-        assert pool.misses > 0                       # eviction actually ran
-        assert pool.pool.used_bytes <= pool.pool.budget_bytes  # never over
 
 
 # ---------------------------------------------------------------------------
@@ -222,23 +232,26 @@ class TestMoEDecodeEquivalence:
     ) -> None:
         torch.manual_seed(3)
         prompt_len, n_decode = 6, 4
-        input_ids = torch.randint(0, config.vocab_size, (prompt_len,))
-        pool = _pool(bank, n_slots=16)
+        input_ids = torch.randint(0, config.vocab_size, (prompt_len,),
+                                  device=weights.device)
+        moe_cache = make_moe_cache(bank, n_slots=16)
 
-        kv = DenseKVCache(config, max_seq_len=128, dtype=torch.float32)
-        our_prefill = prefill_forward_moe(weights, config, pool, kv, input_ids)
+        kv = _kv(config)
+        our_prefill = prefill_forward_moe(weights, config, moe_cache, kv,
+                                          input_ids)
         our_tokens: list[int] = [int(our_prefill.argmax().item())]
         our_logits: list[torch.Tensor] = [our_prefill]
 
         for _ in range(n_decode):
-            logits = decode_step_moe(weights, config, pool, kv, our_tokens[-1])
+            logits = decode_step_moe(weights, config, moe_cache, kv,
+                                     our_tokens[-1])
             our_logits.append(logits)
             our_tokens.append(int(logits.argmax().item()))
 
         with torch.no_grad():
             full_ids = torch.tensor(
                 input_ids.tolist() + our_tokens[:n_decode],
-            ).unsqueeze(0)
+            ).unsqueeze(0).to(weights.device)
             hf_logits_all = hf_model(full_ids).logits[0]
 
         for step in range(n_decode + 1):
@@ -250,27 +263,31 @@ class TestMoEDecodeEquivalence:
         self, weights: DenseWeights, config: ModelConfig, bank: ExpertBank,
         hf_model: MixtralForCausalLM,
     ) -> None:
-        """D5 under pressure: 2 slots, so every layer's routed experts
-        are evicted by the next layer each step — output unchanged."""
+        """D5 under pressure: num_experts slots, so every layer's routed
+        experts are evicted by the next layer each step — output unchanged,
+        and the realized miss rate is observable (M1 gate)."""
         torch.manual_seed(4)
         prompt_len, n_decode = 3, 3
-        input_ids = torch.randint(0, config.vocab_size, (prompt_len,))
-        pool = _pool(bank, n_slots=2)
+        input_ids = torch.randint(0, config.vocab_size, (prompt_len,),
+                                  device=weights.device)
+        moe_cache = make_moe_cache(bank, n_slots=8)
 
-        kv = DenseKVCache(config, max_seq_len=128, dtype=torch.float32)
-        our_prefill = prefill_forward_moe(weights, config, pool, kv, input_ids)
+        kv = _kv(config)
+        our_prefill = prefill_forward_moe(weights, config, moe_cache, kv,
+                                          input_ids)
         our_tokens: list[int] = [int(our_prefill.argmax().item())]
         our_logits: list[torch.Tensor] = [our_prefill]
 
         for _ in range(n_decode):
-            logits = decode_step_moe(weights, config, pool, kv, our_tokens[-1])
+            logits = decode_step_moe(weights, config, moe_cache, kv,
+                                     our_tokens[-1])
             our_logits.append(logits)
             our_tokens.append(int(logits.argmax().item()))
 
         with torch.no_grad():
             full_ids = torch.tensor(
                 input_ids.tolist() + our_tokens[:n_decode],
-            ).unsqueeze(0)
+            ).unsqueeze(0).to(weights.device)
             hf_logits_all = hf_model(full_ids).logits[0]
 
         for step in range(n_decode + 1):
@@ -278,6 +295,8 @@ class TestMoEDecodeEquivalence:
             _assert_allclose(our_logits[step], hf_logits_all[pos],
                              f"tight decode step {step}")
 
-        # hit-rate observable (M1 gate): the metric is exposed and sane
-        assert 0.0 <= pool.hit_rate <= 1.0
-        assert pool.pool.used_bytes <= pool.pool.budget_bytes
+        # hit-rate observable (M1 gate): the tight budget churned every step
+        mstats = moe_cache.decode_miss_stats()
+        assert mstats["layer_calls"] > 0
+        assert mstats["miss_rate"] > 0.0
+        assert 0.0 <= 1.0 - mstats["miss_rate"] <= 1.0

@@ -2,9 +2,12 @@
 
 Same forward logic as runner.py for the dense part; the FFN is a
 Mixtral-style MoE block whose experts are served by an
-ExpertSlotPool. Experts are loaded on demand by routing and
-LRU-evicted from the GPU slot pool — the output is numerically
-identical to keeping every expert resident (D5).
+OffloadMoeCache (the FreeToken port). Movement and kernel dispatch
+follow FreeToken's ``OffloadMoELayer`` routed paths verbatim: prefill
+streams whole layers (double-buffered under ``prefill_overlap``),
+decode loads on demand into the GPU slot cache (or computes on the
+CPU executor for CPU-locked layers); the output is numerically
+identical to keeping every expert resident.
 
 KV stays in the flat contiguous cache (DenseKVCache) for this
 milestone's equivalence anchor; the paged path composes later.
@@ -19,13 +22,128 @@ Weight layout (canonical, dense + MoE):
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 
-from ..store.experts import ExpertSlotPool
+from ..moe.fused import fused_experts_decode_impl, fused_experts_impl, fused_topk
 from .attention import build_rope_cache, qk_norm, rms_norm, rope_positions
-from .moe import moe_forward_sparse, topk_route
 from .runner import DenseKVCache, DenseWeights, ModelConfig, linear
+
+
+# Qwen3 MoE routing hyperparams (the only routed-MoE family PlasticInfer serves;
+# FreeToken keeps these on the MoE layer object).
+_MOE_RENORMALIZE = True
+_MOE_ACTIVATION = "silu"
+_MOE_APPLY_ROUTER_WEIGHT_ON_INPUT = False
+
+# Hybrid decode knob (FreeToken FREETOKEN_HYBRID_OVERLAP): 0 serializes the CPU
+# overflow before the PCIe fetch + GPU GEMM so an A/B isolates the overlap win.
+_HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1").strip().lower() \
+    not in {"0", "false", "no", "off"}
+
+
+def _expert_gemm_bf16(hidden_states, topk_weights, topk_ids, *, views, is_prefill):
+    """bf16 branch of FreeToken's ``_expert_gemm`` (the only quant format here)."""
+    gate_up, down = views
+    impl = fused_experts_impl if is_prefill else fused_experts_decode_impl
+    return impl(hidden_states, gate_up, down, topk_weights, topk_ids,
+                _MOE_ACTIVATION, _MOE_APPLY_ROUTER_WEIGHT_ON_INPUT)
+
+
+def _wait_prefill_overlap(cache, layer_id: int) -> tuple[torch.Tensor, ...]:
+    """Double-buffer choreography for this layer's overlap prefill: kick off the
+    next layer's full-layer H2D copy, then return this layer's bank views (buffer
+    position == expert id, so routing ids pass through unmapped)."""
+    if layer_id == 0:
+        cache.begin_prefill()
+    cache.prefetch_prefill_layer(layer_id)
+    cache.prefetch_prefill_layer(layer_id + 1)
+    return cache.wait_prefill_layer(layer_id)
+
+
+def _prefill_routed(hidden_states, topk_weights, topk_ids, cache, layer_id: int,
+                    num_experts: int) -> torch.Tensor:
+    """Prefill movement (FreeToken ``_prefill_routed``): stream whole layers --
+    double-buffered behind the previous layer's GEMMs when ``prefill_overlap`` is
+    on, else a synchronous ``materialize_layer``. In both, position == expert id."""
+    if cache.prefill_overlap:
+        views = _wait_prefill_overlap(cache, layer_id)
+        out = _expert_gemm_bf16(hidden_states, topk_weights, topk_ids,
+                                views=views, is_prefill=True)
+        cache.release_prefill_layer(layer_id)
+        return out
+    cache.materialize_layer(layer_id)
+    cache.copy_missing()
+    return _expert_gemm_bf16(hidden_states, topk_weights, topk_ids,
+                             views=cache.bank_views(num_experts), is_prefill=True)
+
+
+def _decode_hybrid(cache, layer_id: int, hidden_states, topk_weights, topk_ids):
+    """Hybrid decode (FreeToken ``_decode_hybrid``): GPU computes cache hits +
+    freshly-fetched experts, the CPU executor computes the overflow misses,
+    overlapped, then the partials merge. Requires the M2 CPU executor."""
+    executor = cache.cpu_executor
+    assert executor is not None, "CPU MoE executor was not initialized"
+    raw = topk_ids.clone()  # raw expert ids for the CPU partial
+    cache.ensure_experts_hybrid(layer_id, topk_ids)  # -> slot (hit/fetched) or -1
+    if cache.collect_stats:
+        cache.record_decode_stats_hybrid(layer_id)
+    on_gpu = topk_ids >= 0
+    cpu_ids = torch.where(on_gpu, raw.new_full((), -1), raw).contiguous()
+    pending = executor.decode_submit(layer_id, hidden_states, topk_weights, cpu_ids)
+    cpu_routed_early = (
+        executor.decode_sync(pending) if not _HYBRID_OVERLAP else None
+    )
+    cache.copy_missing()
+    gpu_slots = topk_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
+    gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
+    gpu_routed = _expert_gemm_bf16(hidden_states, gpu_w, gpu_slots,
+                                   views=cache.bank_views(), is_prefill=False)
+    cpu_routed = cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending)
+    return gpu_routed + cpu_routed
+
+
+def _decode_routed(hidden_states, topk_weights, topk_ids, cache,
+                   layer_id: int) -> torch.Tensor:
+    """On-demand decode (FreeToken ``_decode_routed``): ``ensure_experts`` rewrites
+    ``topk_ids`` into cache slot ids in place, then the GEMM reads the full slot
+    cache. CPU-locked layers compute on the executor instead (slot cache untouched,
+    ids stay raw)."""
+    if cache.is_cpu_layer(layer_id):
+        executor = cache.cpu_executor
+        assert executor is not None, "CPU MoE executor was not initialized"
+        return executor.decode(layer_id, hidden_states, topk_weights, topk_ids)
+    if cache.decode_target == "hybrid":
+        return _decode_hybrid(cache, layer_id, hidden_states, topk_weights, topk_ids)
+    cache.ensure_experts(layer_id, topk_ids)
+    cache.copy_missing()
+    return _expert_gemm_bf16(hidden_states, topk_weights, topk_ids,
+                             views=cache.bank_views(), is_prefill=False)
+
+
+def _moe_ffn(x: torch.Tensor, weights: DenseWeights, moe_cache,
+             layer_idx: int, config: ModelConfig, *, is_decode: bool) -> torch.Tensor:
+    """Routed-expert FFN. x is [1, T, H]; returns [1, T, H].
+
+    Prefill writes into the input in place (``fused_experts_impl``), decode
+    allocates (``fused_experts_decode_impl``); the caller captured ``residual``
+    before the call either way, so the overwrite is safe.
+    """
+    T = x.shape[1]
+    xf = x.reshape(-1, config.hidden_dim)   # [T, H]
+
+    router_logits = linear(xf, weights[f"layers.{layer_idx}.mlp.router.weight"])
+    topk_weights, topk_ids = fused_topk(
+        xf, router_logits, config.n_experts_per_tok, _MOE_RENORMALIZE)
+
+    if is_decode:
+        out = _decode_routed(xf, topk_weights, topk_ids, moe_cache, layer_idx)
+    else:
+        out = _prefill_routed(xf, topk_weights, topk_ids, moe_cache, layer_idx,
+                              config.n_experts)
+    return out.reshape(1, T, config.hidden_dim)
 
 
 def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -43,35 +161,10 @@ def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         1, q.shape[1], config.n_heads * config.head_dim)
 
 
-def _moe_ffn(x: torch.Tensor, weights: DenseWeights, pool: ExpertSlotPool,
-             layer_idx: int, config: ModelConfig) -> torch.Tensor:
-    """Routed-expert FFN. x is [1, T, H]; returns [1, T, H]."""
-    T = x.shape[1]
-    xf = x.reshape(-1, config.hidden_dim)   # [T, H] (Mixtral flattens b*s)
-
-    router_logits = linear(xf, weights[f"layers.{layer_idx}.mlp.router.weight"])
-    eids, routing_w = topk_route(router_logits, config.n_experts_per_tok)
-
-    unique = eids.reshape(-1).unique().tolist()
-    # Serve one routed expert at a time and accumulate, so the GPU pool
-    # never needs to hold more than a single expert (D5): a layer can
-    # route more distinct experts than the budget fits (long prompts on
-    # the real model), and eviction can't reclaim pinned pages (D7).
-    moe_out = torch.zeros_like(xf)
-    for eid in unique:
-        exp = pool.ensure(layer_idx, [eid])
-        try:
-            moe_out += moe_forward_sparse(xf, exp, eids, routing_w)
-        finally:
-            pool.release(layer_idx, [eid])
-
-    return moe_out.reshape(1, T, config.hidden_dim)
-
-
 def prefill_forward_moe(
     weights: DenseWeights,
     config: ModelConfig,
-    pool: ExpertSlotPool,
+    moe_cache,
     kv_cache: DenseKVCache,
     input_ids: torch.Tensor,   # [seq_len]
 ) -> torch.Tensor:
@@ -117,7 +210,7 @@ def prefill_forward_moe(
         residual = x
         x = rms_norm(x,
                      weights[f"layers.{layer_idx}.post_attention_layernorm.weight"])
-        x = _moe_ffn(x, weights, pool, layer_idx, config)
+        x = _moe_ffn(x, weights, moe_cache, layer_idx, config, is_decode=False)
         x = residual + x
 
     kv_cache._len = seq_len
@@ -130,7 +223,7 @@ def prefill_forward_moe(
 def decode_step_moe(
     weights: DenseWeights,
     config: ModelConfig,
-    pool: ExpertSlotPool,
+    moe_cache,
     kv_cache: DenseKVCache,
     input_id: int,
 ) -> torch.Tensor:
@@ -175,7 +268,7 @@ def decode_step_moe(
         residual = x
         x = rms_norm(x,
                      weights[f"layers.{layer_idx}.post_attention_layernorm.weight"])
-        x = _moe_ffn(x, weights, pool, layer_idx, config)
+        x = _moe_ffn(x, weights, moe_cache, layer_idx, config, is_decode=True)
         x = residual + x
 
     kv_cache.end_token()

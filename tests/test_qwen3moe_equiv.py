@@ -3,9 +3,9 @@
 This is the real-model milestone's anchor: a *Qwen3Moe*-shaped tiny model
 (norm_topk_prob, per-head QK-norm, fused 3D experts, router named
 mlp.gate) exercised through the same mapping/splitting helpers the
-converter uses, then run through the composed runner (paged KV + slot
-pool). If logits match HF token-by-token, the following are all correct
-together:
+converter uses, then run through the composed runner (paged KV +
+FreeToken offload cache). If logits match HF token-by-token, the
+following are all correct together:
 
   - HF -> canonical name mapping (mlp.gate -> mlp.router)
   - fused gate_up_proj/down_proj -> per-expert w1/w2/w3 split
@@ -13,7 +13,7 @@ together:
   - norm_topk_prob routing == our softmax-over-top-k
   - qwen3_moe head_dim from config (16 here, 128 for the real model)
 
-Runs in fp32 on CPU so numerical noise is negligible (atol=1e-2).
+CUDA + bf16 (the FreeToken port is CUDA-only).
 """
 
 from __future__ import annotations
@@ -29,8 +29,10 @@ from plastic_infer.exec.runner_moe_paged import (
 )
 from plastic_infer.exec.runner_paged import make_kv_config
 from plastic_infer.kv.kv_store import KVStore
-from plastic_infer.store.experts import ExpertBank, ExpertSlotPool
+from plastic_infer.store.experts import ExpertBank
 from plastic_infer.weights.convert import split_state_dict
+
+from _moe_cache_helpers import make_moe_cache, require_cuda
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +99,7 @@ def make_model_config(hf_cfg: Qwen3MoeConfig) -> ModelConfig:
         vocab_size=hf_cfg.vocab_size,
         max_seq_len=hf_cfg.max_position_embeddings,
         rope_base=float(hf_cfg.rope_parameters["rope_theta"]),
-        dtype=torch.float32,
+        dtype=torch.bfloat16,
         qk_norm=True,
         n_experts=hf_cfg.num_local_experts,
         n_experts_per_tok=hf_cfg.num_experts_per_tok,
@@ -122,8 +124,10 @@ def build_weights_and_bank(
 
 @pytest.fixture(scope="module")
 def hf_model() -> Qwen3MoeForCausalLM:
+    dev = require_cuda()
     torch.manual_seed(42)
     model = Qwen3MoeForCausalLM(tiny_qwen3moe_config())
+    model.to(device=dev, dtype=torch.bfloat16)
     model.eval()
     return model
 
@@ -135,8 +139,10 @@ def config(hf_model: Qwen3MoeForCausalLM) -> ModelConfig:
 
 @pytest.fixture(scope="module")
 def weights(hf_model: Qwen3MoeForCausalLM) -> DenseWeights:
+    dev = require_cuda()
     w, _bank = build_weights_and_bank(hf_model)
-    return w
+    return DenseWeights({k: v.to(device=dev, dtype=torch.bfloat16)
+                         for k, v in w.w.items()})
 
 
 @pytest.fixture(scope="module")
@@ -145,15 +151,17 @@ def bank(hf_model: Qwen3MoeForCausalLM) -> ExpertBank:
     return bank
 
 
-def _pool(bank: ExpertBank, n_slots: int) -> ExpertSlotPool:
-    one_expert = bank.bytes(next(iter(bank.keys())))
-    return ExpertSlotPool(bank, budget_bytes=n_slots * one_expert)
+def _kv(config: ModelConfig, weights: DenseWeights) -> tuple[KVStore, KVStore]:
+    """A CUDA bf16 KVStore + fresh request cache."""
+    store = KVStore(make_kv_config(config, max_pages=512,
+                                   device=weights.device))
+    return store, store.new_request()
 
 
 def _assert_allclose(a: torch.Tensor, b: torch.Tensor, where: str) -> None:
     assert a.shape == b.shape
-    assert torch.allclose(a, b, atol=1e-2), (
-        f"{where}: max diff = {(a - b).abs().max().item():.6f}"
+    assert torch.allclose(a.float(), b.float(), atol=0.05, rtol=0.05), (
+        f"{where}: max diff = {(a - b).float().abs().max().item():.6f}"
     )
 
 
@@ -167,11 +175,12 @@ class TestQwen3MoePrefillEquivalence:
         hf_model: Qwen3MoeForCausalLM,
     ) -> None:
         torch.manual_seed(0)
-        input_ids = torch.randint(0, config.vocab_size, (16,))
-        store = KVStore(make_kv_config(config, max_pages=512))
-        cache = store.new_request()
+        input_ids = torch.randint(0, config.vocab_size, (16,),
+                                  device=weights.device)
+        moe_cache = make_moe_cache(bank, n_slots=16)
+        store, cache = _kv(config, weights)
         our_logits = prefill_forward_moe_paged(
-            weights, config, _pool(bank, n_slots=16), store, cache, input_ids,
+            weights, config, moe_cache, store, cache, input_ids,
         )
 
         with torch.no_grad():
@@ -185,17 +194,17 @@ class TestQwen3MoePrefillEquivalence:
     ) -> None:
         """All positions match (prefixes of increasing length)."""
         torch.manual_seed(1)
-        input_ids = torch.randint(0, config.vocab_size, (8,))
+        input_ids = torch.randint(0, config.vocab_size, (8,),
+                                  device=weights.device)
+        moe_cache = make_moe_cache(bank, n_slots=16)
 
         with torch.no_grad():
             hf_logits_all = hf_model(input_ids.unsqueeze(0)).logits[0]
 
         for i in range(1, 9):
-            store = KVStore(make_kv_config(config, max_pages=512))
-            cache = store.new_request()
+            store, cache = _kv(config, weights)
             our_logits = prefill_forward_moe_paged(
-                weights, config, _pool(bank, n_slots=16), store, cache,
-                input_ids[:i],
+                weights, config, moe_cache, store, cache, input_ids[:i],
             )
             _assert_allclose(our_logits, hf_logits_all[i - 1],
                              f"position {i - 1}")
@@ -204,22 +213,21 @@ class TestQwen3MoePrefillEquivalence:
         self, weights: DenseWeights, config: ModelConfig, bank: ExpertBank,
         hf_model: Qwen3MoeForCausalLM,
     ) -> None:
-        """D5: 2 slots force constant eviction yet logits are identical."""
+        """D5: the tightest slot budget the cache allows still matches HF;
+        prefill streams whole layers, so placement cannot enter at all."""
         torch.manual_seed(2)
-        input_ids = torch.randint(0, config.vocab_size, (8,))
-        store = KVStore(make_kv_config(config, max_pages=512))
-        pool = _pool(bank, n_slots=2)
-        cache = store.new_request()
+        input_ids = torch.randint(0, config.vocab_size, (8,),
+                                  device=weights.device)
+        moe_cache = make_moe_cache(bank, n_slots=4)
+        store, cache = _kv(config, weights)
         our_logits = prefill_forward_moe_paged(
-            weights, config, pool, store, cache, input_ids,
+            weights, config, moe_cache, store, cache, input_ids,
         )
 
         with torch.no_grad():
             hf_logits = hf_model(input_ids.unsqueeze(0)).logits[0, -1]
 
         _assert_allclose(our_logits, hf_logits, "qwen3moe tight prefill")
-        assert pool.misses > 0                       # eviction actually ran
-        assert pool.pool.used_bytes <= pool.pool.budget_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -233,19 +241,18 @@ class TestQwen3MoeDecodeEquivalence:
     ) -> None:
         torch.manual_seed(3)
         prompt_len, n_decode = 6, 4
-        input_ids = torch.randint(0, config.vocab_size, (prompt_len,))
-
-        store = KVStore(make_kv_config(config, max_pages=512))
-        pool = _pool(bank, n_slots=16)
-        cache = store.new_request()
+        input_ids = torch.randint(0, config.vocab_size, (prompt_len,),
+                                  device=weights.device)
+        moe_cache = make_moe_cache(bank, n_slots=16)
+        store, cache = _kv(config, weights)
         our_prefill = prefill_forward_moe_paged(
-            weights, config, pool, store, cache, input_ids,
+            weights, config, moe_cache, store, cache, input_ids,
         )
         our_tokens: list[int] = [int(our_prefill.argmax().item())]
         our_logits: list[torch.Tensor] = [our_prefill]
         for _ in range(n_decode):
             logits = decode_step_moe_paged(
-                weights, config, pool, store, cache, our_tokens[-1],
+                weights, config, moe_cache, store, cache, our_tokens[-1],
             )
             our_logits.append(logits)
             our_tokens.append(int(logits.argmax().item()))
@@ -253,7 +260,7 @@ class TestQwen3MoeDecodeEquivalence:
         with torch.no_grad():
             full_ids = torch.tensor(
                 input_ids.tolist() + our_tokens[:n_decode],
-            ).unsqueeze(0)
+            ).unsqueeze(0).to(weights.device)
             hf_logits_all = hf_model(full_ids).logits[0]
 
         for step in range(n_decode + 1):
@@ -265,22 +272,21 @@ class TestQwen3MoeDecodeEquivalence:
         self, weights: DenseWeights, config: ModelConfig, bank: ExpertBank,
         hf_model: Qwen3MoeForCausalLM,
     ) -> None:
-        """D5 + paged KV under a 2-slot budget."""
+        """D5 + paged KV under the tightest cache budget (== num_experts)."""
         torch.manual_seed(4)
         prompt_len, n_decode = 3, 3
-        input_ids = torch.randint(0, config.vocab_size, (prompt_len,))
-
-        store = KVStore(make_kv_config(config, max_pages=512))
-        pool = _pool(bank, n_slots=2)
-        cache = store.new_request()
+        input_ids = torch.randint(0, config.vocab_size, (prompt_len,),
+                                  device=weights.device)
+        moe_cache = make_moe_cache(bank, n_slots=4)
+        store, cache = _kv(config, weights)
         our_prefill = prefill_forward_moe_paged(
-            weights, config, pool, store, cache, input_ids,
+            weights, config, moe_cache, store, cache, input_ids,
         )
         our_tokens: list[int] = [int(our_prefill.argmax().item())]
         our_logits: list[torch.Tensor] = [our_prefill]
         for _ in range(n_decode):
             logits = decode_step_moe_paged(
-                weights, config, pool, store, cache, our_tokens[-1],
+                weights, config, moe_cache, store, cache, our_tokens[-1],
             )
             our_logits.append(logits)
             our_tokens.append(int(logits.argmax().item()))
@@ -288,7 +294,7 @@ class TestQwen3MoeDecodeEquivalence:
         with torch.no_grad():
             full_ids = torch.tensor(
                 input_ids.tolist() + our_tokens[:n_decode],
-            ).unsqueeze(0)
+            ).unsqueeze(0).to(weights.device)
             hf_logits_all = hf_model(full_ids).logits[0]
 
         for step in range(n_decode + 1):
@@ -296,5 +302,8 @@ class TestQwen3MoeDecodeEquivalence:
             _assert_allclose(our_logits[step], hf_logits_all[pos],
                              f"tight decode step {step}")
 
-        assert 0.0 <= pool.hit_rate <= 1.0
-        assert pool.pool.used_bytes <= pool.pool.budget_bytes
+        # hit-rate observable (M1 gate): the tight budget churned every step
+        mstats = moe_cache.decode_miss_stats()
+        assert mstats["layer_calls"] > 0
+        assert mstats["miss_rate"] > 0.0
+        assert 0.0 <= 1.0 - mstats["miss_rate"] <= 1.0

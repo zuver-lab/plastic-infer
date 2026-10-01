@@ -224,6 +224,10 @@ class Engine:
         # FreeToken offload-MoE cache (banks + slot cache + executor), built once
         # on the first request (loading all expert banks is the expensive part).
         self._moe_cache: OffloadMoeCache | None = None
+        # Persistent CPU MoE executor (decode-time expert compute) for the CPU-
+        # locked / hybrid layers, built alongside the cache; None for plain GPU
+        # offload. Per-step raise_if_unhealthy() mirrors FreeToken's forward_batch.
+        self.cpu_moe_executor = None
 
     def _load_dense(self) -> DenseWeights:
         """Load all dense + shared weights onto the run device."""
@@ -313,15 +317,36 @@ class Engine:
         return cache
 
     def _init_cpu_moe_executor(self, cache) -> None:
-        """Build the persistent CPU MoE executor (M2, ``_cpu_moe`` extension).
+        """Build the persistent CPU MoE executor (decode-time expert compute).
 
-        Not built yet: reaching this means cpu_layer_ids were forced without the
-        extension, which must fail loudly (FreeToken's explicit-pick contract)
-        rather than crash mid-forward.
+        Faithful port of FreeToken's engine ``_init_cpu_moe_executor``: construct
+        the executor over this cache's host banks, attach it (``set_cpu_executor``
+        gates on decode_target in {"cpu", "hybrid"}) and keep a reference for the
+        per-step ``raise_if_unhealthy`` watchdog check. FreeToken reads
+        top_k/activation/apply_router_weight_on_input off the first MoE layer
+        module; PlasticInfer's runner carries them as module constants, so they
+        come from there. Must run before any decode (the worker pool has to be
+        live and the pinned IO buffers stable).
         """
-        raise NotImplementedError(
-            "CPU MoE executor (M2) is not built yet; CPU-locked MoE layers need "
-            "the compiled _cpu_moe extension")
+        from ..exec.runner_moe import (
+            _MOE_ACTIVATION,
+            _MOE_APPLY_ROUTER_WEIGHT_ON_INPUT,
+        )
+        from ..moe.cpu_executor import CpuMoeExecutor
+
+        executor = CpuMoeExecutor(
+            cache,
+            top_k=self.config.n_experts_per_tok,
+            activation=_MOE_ACTIVATION,
+            apply_router_weight_on_input=_MOE_APPLY_ROUTER_WEIGHT_ON_INPUT,
+            num_threads=0,          # auto: one thread per physical core
+            max_tokens=1,           # this engine decodes one request at a time
+            device=self.device,
+            swiglu_alpha=1.702,     # silu activation; swiglu defaults unused
+            swiglu_limit=None,
+        )
+        cache.set_cpu_executor(executor)
+        self.cpu_moe_executor = executor
 
     def stream(self, input_ids: list[int], *, max_new_tokens: int = 16,
                request: RequestMeta | None = None):
@@ -409,6 +434,10 @@ class Engine:
         logits = prefill_forward_moe_paged(weights, self.config, moe_cache,
                                            store, cache, ids)
         prefill_s = time.monotonic() - t_setup
+        if self.cpu_moe_executor is not None:
+            # one pinned read per forward (FreeToken forward_batch): a dead
+            # flag-handshake coordinator surfaces loudly, not as stale outputs
+            self.cpu_moe_executor.raise_if_unhealthy()
 
         tokens = list(input_ids)
         # First generated token comes from the prefill logits (they
@@ -423,6 +452,8 @@ class Engine:
         for _ in range(max_new_tokens - 1):
             logits = decode_step_moe_paged(weights, self.config, moe_cache,
                                            store, cache, tokens[-1])
+            if self.cpu_moe_executor is not None:
+                self.cpu_moe_executor.raise_if_unhealthy()
             tokens.append(int(logits.argmax().item()))
             yield tokens[-1], time.monotonic() - t_start
         decode_s = time.monotonic() - t_dec

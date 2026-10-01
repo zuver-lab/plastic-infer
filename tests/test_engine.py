@@ -122,6 +122,30 @@ class TestEngineEquivalence:
         b = engine.run(prompt, max_new_tokens=5).tokens
         assert a == b
 
+    def test_cpu_locked_decode_matches_hf(self, model_dir, hf_model,
+                                          monkeypatch) -> None:
+        """Shrinking the WSL pin budget below the tiny banks auto-locks every
+        MoE layer to CPU decode (_auto_cpu_layers -> _init_cpu_moe_executor):
+        the _cpu_moe executor is built and greedy decode still matches HF
+        token-for-token."""
+        monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", "0.000001")
+        eng = Engine(model_dir[0], _profile(), device=require_cuda())
+        torch.manual_seed(32)
+        prompt = torch.randint(0, eng.config.vocab_size, (8,)).tolist()
+        n_gen = 4
+        result = eng.run(prompt, max_new_tokens=n_gen)
+        assert eng.cpu_moe_executor is not None
+        assert eng._moe_cache is not None
+        assert eng._moe_cache.decode_target == "cpu"
+
+        with torch.no_grad():
+            hf_ids = hf_model.generate(
+                torch.tensor([prompt], device=hf_model.device),
+                max_new_tokens=n_gen, do_sample=False, use_cache=True)
+        assert result.tokens[len(prompt):] == hf_ids[0, len(prompt):].tolist(), (
+            f"cpu-locked decode {result.tokens[len(prompt):]} != HF "
+            f"{hf_ids[0, len(prompt):].tolist()}")
+
     def test_stream_timing_and_run_equivalence(self, engine: Engine) -> None:
         """stream() yields one (token, elapsed) per generated token with
         non-decreasing elapsed, and run() (which drains it) gives the

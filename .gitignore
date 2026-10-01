@@ -28,3 +28,10 @@ venv/
 
 # Downloaded model dirs (weights + shards + logs)
 models/
+
+# External reference repos (AirLLM etc.)
+reference/
+
+# Built-on-demand _cpu_moe extension (M2)
+src/plastic_infer/kernel/_cpu_moe.so
+src/plastic_infer/kernel/_cpu_moe.build_stamp

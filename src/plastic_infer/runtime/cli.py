@@ -95,6 +95,8 @@ def main(argv: list[str] | None = None) -> int:
     p_conv.add_argument("hf_dir")
     p_conv.add_argument("out_dir")
     p_conv.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16")
+    p_conv.add_argument("--delete-original", action="store_true",
+                        help="rm the HF source dir after a successful convert")
     p_conv.set_defaults(cmd="convert")
 
     p_run = sub.add_parser("run", help="run a converted model")
@@ -110,7 +112,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.cmd == "convert":
         dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
-        convert(args.hf_dir, args.out_dir, dtype=dtype)
+        convert(args.hf_dir, args.out_dir, dtype=dtype,
+                delete_original=args.delete_original)
         print(f"converted {args.hf_dir} -> {args.out_dir}")
     else:
         _run_cli(args)

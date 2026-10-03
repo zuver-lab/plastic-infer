@@ -27,6 +27,7 @@ only the bytes actually sliced are paged in; at most one layer's weights
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -247,13 +248,44 @@ def _convert_layers(source, config: dict, out_dir: Path, dtype: torch.dtype) -> 
 # ---------------------------------------------------------------------------
 
 
+def link_or_copy_file(src: str | Path, dst: str | Path) -> str:
+    """Point dst at src without duplicating bytes, falling back to a copy.
+
+    A hard link is preferred (zero extra disk, survives either path being
+    deleted); symlink when the filesystems differ; plain copy last. This
+    mirrors AirLLM's link_or_copy_file — the converted metadata files are
+    byte-identical to the HF originals, so we never pay to duplicate them.
+    """
+    src = Path(os.path.realpath(str(src)))
+    dst = Path(dst)
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
+    try:
+        os.link(src, dst)
+        return "hardlink"
+    except OSError:
+        pass
+    try:
+        os.symlink(src, dst)
+        return "symlink"
+    except OSError:
+        pass
+    shutil.copy2(src, dst)
+    return "copy"
+
+
 def convert(hf_dir: str | Path, out_dir: str | Path,
-            dtype: torch.dtype = torch.bfloat16) -> None:
+            dtype: torch.dtype = torch.bfloat16,
+            *, delete_original: bool = False) -> None:
     """Convert a HuggingFace Qwen3MoE directory to our disk layout.
 
     Reads model.safetensors.index.json (or a single model.safetensors)
     to locate tensors, then streams layer by layer. Copies config.json
-    and tokenizer files for the engine.
+    and tokenizer files for the engine (hard-linked where possible).
+
+    With delete_original=True the HF source directory is removed after a
+    successful conversion, reclaiming the checkpoint's disk (the engine
+    only reads the converted layout). Nothing is deleted on error.
     """
     hf_dir = Path(hf_dir)
     out_dir = Path(out_dir)
@@ -283,7 +315,10 @@ def convert(hf_dir: str | Path, out_dir: str | Path,
                "generation_config.json"):
         p = hf_dir / fn
         if p.exists():
-            shutil.copy2(p, out_dir / fn)
+            link_or_copy_file(p, out_dir / fn)
+
+    if delete_original:
+        shutil.rmtree(hf_dir)
 
 
 def convert_from_dict(flat: dict[str, torch.Tensor], config: dict,
